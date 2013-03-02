@@ -61,9 +61,13 @@ start_server {tags {"repl"}} {
         
         test {SET on the master should immediately propagate} {
             r -1 set mykey bar
-            if {$::valgrind} {after 2000}
-            r  0 get mykey
-        } {bar}
+
+            wait_for_condition 500 100 {
+                [r  0 get mykey] eq {bar}
+            } else {
+                fail "SET on master did not propagated on slave"
+            }
+        }
 
         test {FLUSHALL should replicate} {
             r -1 flushall
@@ -74,7 +78,8 @@ start_server {tags {"repl"}} {
 }
 
 proc start_write_load {host port seconds} {
-    exec tclsh8.5 tests/helpers/gen_write_load.tcl $host $port $seconds &
+    set tclsh [info nameofexecutable]
+    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds &
 }
 
 proc stop_write_load {handle} {

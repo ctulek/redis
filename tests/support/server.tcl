@@ -38,7 +38,9 @@ proc kill_server config {
             if {[string match {*Darwin*} [exec uname -a]]} {
                 tags {"leaks"} {
                     test "Check for memory leaks (pid $pid)" {
-                        exec leaks $pid
+                        set output {0 leaks}
+                        catch {exec leaks $pid} output
+                        set output
                     } {*0 leaks*}
                 }
             }
@@ -82,8 +84,8 @@ proc ping_server {host port} {
         puts $fd "PING\r\n"
         flush $fd
         set reply [gets $fd]
-        if {[string range $reply 0 4] eq {+PONG} ||
-            [string range $reply 0 3] eq {-ERR}} {
+        if {[string range $reply 0 0] eq {+} ||
+            [string range $reply 0 0] eq {-}} {
             set retval 1
         }
         close $fd
@@ -107,7 +109,7 @@ proc tags {tags code} {
 }
 
 proc start_server {options {code undefined}} {
-    # If we are runnign against an external server, we just push the
+    # If we are running against an external server, we just push the
     # host/port pair in the stack the first time
     if {$::external} {
         if {[llength $::servers] == 0} {
