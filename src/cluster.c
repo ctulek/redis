@@ -1,3 +1,33 @@
+/* Redis Cluster implementation.
+ *
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 #include "endianconv.h"
 
@@ -16,6 +46,9 @@ sds clusterGenNodesDescription(void);
 clusterNode *clusterLookupNode(char *name);
 int clusterNodeAddSlave(clusterNode *master, clusterNode *slave);
 int clusterAddSlot(clusterNode *n, int slot);
+int clusterDelSlot(int slot);
+int clusterNodeSetSlotBit(clusterNode *n, int slot);
+int bitmapTestBit(unsigned char *bitmap, int pos);
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -58,8 +91,8 @@ int clusterLoadConfig(char *filename) {
             p = strchr(s,',');
             if (p) *p = '\0';
             if (!strcasecmp(s,"myself")) {
-                redisAssert(server.cluster.myself == NULL);
-                server.cluster.myself = n;
+                redisAssert(server.cluster->myself == NULL);
+                server.cluster->myself = n;
                 n->flags |= REDIS_NODE_MYSELF;
             } else if (!strcasecmp(s,"master")) {
                 n->flags |= REDIS_NODE_MASTER;
@@ -119,9 +152,9 @@ int clusterLoadConfig(char *filename) {
                     clusterAddNode(cn);
                 }
                 if (direction == '>') {
-                    server.cluster.migrating_slots_to[slot] = cn;
+                    server.cluster->migrating_slots_to[slot] = cn;
                 } else {
-                    server.cluster.importing_slots_from[slot] = cn;
+                    server.cluster->importing_slots_from[slot] = cn;
                 }
                 continue;
             } else if ((p = strchr(argv[j],'-')) != NULL) {
@@ -140,14 +173,14 @@ int clusterLoadConfig(char *filename) {
     fclose(fp);
 
     /* Config sanity check */
-    redisAssert(server.cluster.myself != NULL);
+    redisAssert(server.cluster->myself != NULL);
     redisLog(REDIS_NOTICE,"Node configuration loaded, I'm %.40s",
-        server.cluster.myself->name);
+        server.cluster->myself->name);
     clusterUpdateState();
     return REDIS_OK;
 
 fmterr:
-    redisLog(REDIS_WARNING,"Unrecovarable error: corrupted cluster config file.");
+    redisLog(REDIS_WARNING,"Unrecoverable error: corrupted cluster config file.");
     fclose(fp);
     exit(1);
 }
@@ -160,7 +193,7 @@ int clusterSaveConfig(void) {
     sds ci = clusterGenNodesDescription();
     int fd;
     
-    if ((fd = open(server.cluster.configfile,O_WRONLY|O_CREAT|O_TRUNC,0644))
+    if ((fd = open(server.cluster_configfile,O_WRONLY|O_CREAT|O_TRUNC,0644))
         == -1) goto err;
     if (write(fd,ci,sdslen(ci)) != (ssize_t)sdslen(ci)) goto err;
     close(fd);
@@ -182,23 +215,26 @@ void clusterSaveConfigOrDie(void) {
 void clusterInit(void) {
     int saveconf = 0;
 
-    server.cluster.myself = NULL;
-    server.cluster.state = REDIS_CLUSTER_FAIL;
-    server.cluster.nodes = dictCreate(&clusterNodesDictType,NULL);
-    server.cluster.node_timeout = 15;
-    memset(server.cluster.migrating_slots_to,0,
-        sizeof(server.cluster.migrating_slots_to));
-    memset(server.cluster.importing_slots_from,0,
-        sizeof(server.cluster.importing_slots_from));
-    memset(server.cluster.slots,0,
-        sizeof(server.cluster.slots));
-    if (clusterLoadConfig(server.cluster.configfile) == REDIS_ERR) {
+    server.cluster = zmalloc(sizeof(clusterState));
+    server.cluster->myself = NULL;
+    server.cluster->state = REDIS_CLUSTER_FAIL;
+    server.cluster->size = 1;
+    server.cluster->nodes = dictCreate(&clusterNodesDictType,NULL);
+    server.cluster->node_timeout = 15;
+    memset(server.cluster->migrating_slots_to,0,
+        sizeof(server.cluster->migrating_slots_to));
+    memset(server.cluster->importing_slots_from,0,
+        sizeof(server.cluster->importing_slots_from));
+    memset(server.cluster->slots,0,
+        sizeof(server.cluster->slots));
+    if (clusterLoadConfig(server.cluster_configfile) == REDIS_ERR) {
         /* No configuration found. We will just use the random name provided
          * by the createClusterNode() function. */
-        server.cluster.myself = createClusterNode(NULL,REDIS_NODE_MYSELF);
+        server.cluster->myself =
+            createClusterNode(NULL,REDIS_NODE_MYSELF|REDIS_NODE_MASTER);
         redisLog(REDIS_NOTICE,"No cluster configuration found, I'm %.40s",
-            server.cluster.myself->name);
-        clusterAddNode(server.cluster.myself);
+            server.cluster->myself->name);
+        clusterAddNode(server.cluster->myself);
         saveconf = 1;
     }
     if (saveconf) clusterSaveConfigOrDie();
@@ -210,8 +246,8 @@ void clusterInit(void) {
         exit(1);
     }
     if (aeCreateFileEvent(server.el, server.cfd, AE_READABLE,
-        clusterAcceptHandler, NULL) == AE_ERR) oom("creating file event");
-    server.cluster.slots_to_keys = zslCreate();
+        clusterAcceptHandler, NULL) == AE_ERR) redisPanic("Unrecoverable error creating Redis Cluster file event.");
+    server.cluster->slots_to_keys = zslCreate();
 }
 
 /* -----------------------------------------------------------------------------
@@ -269,10 +305,10 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
  * Key space handling
  * -------------------------------------------------------------------------- */
 
-/* We have 4096 hash slots. The hash slot of a given key is obtained
- * as the least significant 12 bits of the crc16 of the key. */
+/* We have 16384 hash slots. The hash slot of a given key is obtained
+ * as the least significant 14 bits of the crc16 of the key. */
 unsigned int keyHashSlot(char *key, int keylen) {
-    return crc16(key,keylen) & 0x0FFF;
+    return crc16(key,keylen) & 0x3FFF;
 }
 
 /* -----------------------------------------------------------------------------
@@ -295,6 +331,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
         getRandomHexChars(node->name, REDIS_CLUSTER_NAMELEN);
     node->flags = flags;
     memset(node->slots,0,sizeof(node->slots));
+    node->numslots = 0;
     node->numslaves = 0;
     node->slaves = NULL;
     node->slaveof = NULL;
@@ -302,7 +339,105 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->configdigest = NULL;
     node->configdigest_ts = 0;
     node->link = NULL;
+    memset(node->ip,0,sizeof(node->ip));
+    node->port = 0;
+    node->fail_reports = listCreate();
+    listSetFreeMethod(node->fail_reports,zfree);
     return node;
+}
+
+/* This function is called every time we get a failure report from a node.
+ * The side effect is to populate the fail_reports list (or to update
+ * the timestamp of an existing report).
+ *
+ * 'failing' is the node that is in failure state according to the
+ * 'sender' node.
+ *
+ * The function returns 0 if it just updates a timestamp of an existing
+ * failure report from the same sender. 1 is returned if a new failure
+ * report is created. */
+int clusterNodeAddFailureReport(clusterNode *failing, clusterNode *sender) {
+    list *l = failing->fail_reports;
+    listNode *ln;
+    listIter li;
+    clusterNodeFailReport *fr;
+
+    /* If a failure report from the same sender already exists, just update
+     * the timestamp. */
+    listRewind(l,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        fr = ln->value;
+        if (fr->node == sender) {
+            fr->time = time(NULL);
+            return 0;
+        }
+    }
+
+    /* Otherwise create a new report. */
+    fr = zmalloc(sizeof(*fr));
+    fr->node = sender;
+    fr->time = time(NULL);
+    listAddNodeTail(l,fr);
+    return 1;
+}
+
+/* Remove failure reports that are too old, where too old means reasonably
+ * older than the global node timeout. Note that anyway for a node to be
+ * flagged as FAIL we need to have a local PFAIL state that is at least
+ * older than the global node timeout, so we don't just trust the number
+ * of failure reports from other nodes. */
+void clusterNodeCleanupFailureReports(clusterNode *node) {
+    list *l = node->fail_reports;
+    listNode *ln;
+    listIter li;
+    clusterNodeFailReport *fr;
+    time_t maxtime = server.cluster->node_timeout*2;
+    time_t now = time(NULL);
+
+    listRewind(l,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        fr = ln->value;
+        if (now - fr->time > maxtime) listDelNode(l,ln);
+    }
+}
+
+/* Remove the failing report for 'node' if it was previously considered
+ * failing by 'sender'. This function is called when a node informs us via
+ * gossip that a node is OK from its point of view (no FAIL or PFAIL flags).
+ *
+ * Note that this function is called relatively often as it gets called even
+ * when there are no nodes failing, and is O(N), however when the cluster is
+ * fine the failure reports list is empty so the function runs in constant
+ * time.
+ *
+ * The function returns 1 if the failure report was found and removed.
+ * Otherwise 0 is returned. */
+int clusterNodeDelFailureReport(clusterNode *node, clusterNode *sender) {
+    list *l = node->fail_reports;
+    listNode *ln;
+    listIter li;
+    clusterNodeFailReport *fr;
+
+    /* Search for a failure report from this sender. */
+    listRewind(l,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        fr = ln->value;
+        if (fr->node == sender) break;
+    }
+    if (!ln) return 0; /* No failure report from this sender. */
+
+    /* Remove the failure report. */
+    listDelNode(l,ln);
+    clusterNodeCleanupFailureReports(node);
+    return 1;
+}
+
+/* Return the number of external nodes that believe 'node' is failing,
+ * not including this node, that may have a PFAIL or FAIL state for this
+ * node as well. */
+int clusterNodeFailureReportsCount(clusterNode *node) {
+    clusterNodeCleanupFailureReports(node);
+    return listLength(node->fail_reports);
 }
 
 int clusterNodeRemoveSlave(clusterNode *master, clusterNode *slave) {
@@ -339,12 +474,13 @@ void clusterNodeResetSlaves(clusterNode *n) {
 
 void freeClusterNode(clusterNode *n) {
     sds nodename;
-    
+
     nodename = sdsnewlen(n->name, REDIS_CLUSTER_NAMELEN);
-    redisAssert(dictDelete(server.cluster.nodes,nodename) == DICT_OK);
+    redisAssert(dictDelete(server.cluster->nodes,nodename) == DICT_OK);
     sdsfree(nodename);
     if (n->slaveof) clusterNodeRemoveSlave(n->slaveof, n);
     if (n->link) freeClusterLink(n->link);
+    listRelease(n->fail_reports);
     zfree(n);
 }
 
@@ -352,9 +488,44 @@ void freeClusterNode(clusterNode *n) {
 int clusterAddNode(clusterNode *node) {
     int retval;
     
-    retval = dictAdd(server.cluster.nodes,
+    retval = dictAdd(server.cluster->nodes,
             sdsnewlen(node->name,REDIS_CLUSTER_NAMELEN), node);
     return (retval == DICT_OK) ? REDIS_OK : REDIS_ERR;
+}
+
+/* Remove a node from the cluster:
+ * 1) Mark all the nodes handled by it as unassigned.
+ * 2) Remove all the failure reports sent by this node.
+ * 3) Free the node, that will in turn remove it from the hash table
+ *    and from the list of slaves of its master, if it is a slave node.
+ */
+void clusterDelNode(clusterNode *delnode) {
+    int j;
+    dictIterator *di;
+    dictEntry *de;
+
+    /* 1) Mark slots as unassigned. */
+    for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) {
+        if (server.cluster->importing_slots_from[j] == delnode)
+            server.cluster->importing_slots_from[j] = NULL;
+        if (server.cluster->migrating_slots_to[j] == delnode)
+            server.cluster->migrating_slots_to[j] = NULL;
+        if (server.cluster->slots[j] == delnode)
+            clusterDelSlot(j);
+    }
+
+    /* 2) Remove failure reports. */
+    di = dictGetIterator(server.cluster->nodes);
+    while((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+
+        if (node == delnode) continue;
+        clusterNodeDelFailureReport(node,delnode);
+    }
+    dictReleaseIterator(di);
+
+    /* 3) Free the node, unlinking it from the cluster. */
+    freeClusterNode(delnode);
 }
 
 /* Node lookup by name */
@@ -362,7 +533,7 @@ clusterNode *clusterLookupNode(char *name) {
     sds s = sdsnewlen(name, REDIS_CLUSTER_NAMELEN);
     struct dictEntry *de;
 
-    de = dictFind(server.cluster.nodes,s);
+    de = dictFind(server.cluster->nodes,s);
     sdsfree(s);
     if (de == NULL) return NULL;
     return dictGetVal(de);
@@ -378,7 +549,7 @@ void clusterRenameNode(clusterNode *node, char *newname) {
    
     redisLog(REDIS_DEBUG,"Renaming node %.40s into %.40s",
         node->name, newname);
-    retval = dictDelete(server.cluster.nodes, s);
+    retval = dictDelete(server.cluster->nodes, s);
     sdsfree(s);
     redisAssert(retval == DICT_OK);
     memcpy(node->name, newname, REDIS_CLUSTER_NAMELEN);
@@ -388,6 +559,59 @@ void clusterRenameNode(clusterNode *node, char *newname) {
 /* -----------------------------------------------------------------------------
  * CLUSTER messages exchange - PING/PONG and gossip
  * -------------------------------------------------------------------------- */
+
+/* This function checks if a given node should be marked as FAIL.
+ * It happens if the following conditions are met:
+ *
+ * 1) We are a master node. Only master nodes can mark a node as failing.
+ * 2) We received enough failure reports from other nodes via gossip.
+ *    Enough means that the majority of the masters believe the node is
+ *    down.
+ * 3) We believe this node is in PFAIL state.
+ *
+ * If a failure is detected we also inform the whole cluster about this
+ * event trying to force every other node to set the FAIL flag for the node.
+ */
+void markNodeAsFailingIfNeeded(clusterNode *node) {
+    int failures;
+    int needed_quorum = (server.cluster->size / 2) + 1;
+
+    if (!(server.cluster->myself->flags & REDIS_NODE_MASTER)) return;
+    if (!(node->flags & REDIS_NODE_PFAIL)) return; /* We can reach it. */
+    if (node->flags & REDIS_NODE_FAIL) return; /* Already FAILing. */
+
+    failures = 1 + clusterNodeFailureReportsCount(node); /* +1 is for myself. */
+    if (failures < needed_quorum) return;
+
+    redisLog(REDIS_NOTICE,
+        "Marking node %.40s as failing (quorum reached).", node->name);
+
+    /* Mark the node as failing. */
+    node->flags &= ~REDIS_NODE_PFAIL;
+    node->flags |= REDIS_NODE_FAIL;
+
+    /* Broadcast the failing node name to everybody */
+    clusterSendFail(node->name);
+    clusterUpdateState();
+    clusterSaveConfigOrDie();
+}
+
+/* This function is called only if a node is marked as FAIL, but we are able
+ * to reach it again. It checks if there are the conditions to undo the FAIL
+ * state.
+ *
+ * Currently we only revert the FAIL state if there are no slaves for this
+ * node, so that no election was possible. */
+void clearNodeFailureIfNeeded(clusterNode *node) {
+    if (node->flags & REDIS_NODE_FAIL && !node->numslaves) {
+        redisLog(REDIS_NOTICE,
+            "Clear FAIL state for node %.40s: is reachable and has no slaves.",
+                node->name);
+        node->flags &= ~REDIS_NODE_FAIL;
+        clusterUpdateState();
+        clusterSaveConfigOrDie();
+    }
+}
 
 /* Process the gossip section of PING or PONG packets.
  * Note that this function assumes that the packet is already sanity-checked
@@ -431,18 +655,24 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                  redisLog(REDIS_DEBUG,"Node pong_received updated by gossip");
                 node->pong_received = ntohl(g->pong_received);
             }
-            /* Mark this node as FAILED if we think it is possibly failing
-             * and another node also thinks it's failing. */
-            if (node->flags & REDIS_NODE_PFAIL &&
-                (flags & (REDIS_NODE_FAIL|REDIS_NODE_PFAIL)))
+            /* Handle failure reports, only when the sender is a master. */
+            if (sender && sender->flags & REDIS_NODE_MASTER &&
+                node != server.cluster->myself)
             {
-                redisLog(REDIS_NOTICE,"Received a PFAIL acknowledge from node %.40s, marking node %.40s as FAIL!", hdr->sender, node->name);
-                node->flags &= ~REDIS_NODE_PFAIL;
-                node->flags |= REDIS_NODE_FAIL;
-                /* Broadcast the failing node name to everybody */
-                clusterSendFail(node->name);
-                clusterUpdateState();
-                clusterSaveConfigOrDie();
+                if (flags & (REDIS_NODE_FAIL|REDIS_NODE_PFAIL)) {
+                    if (clusterNodeAddFailureReport(node,sender)) {
+                        redisLog(REDIS_NOTICE,
+                            "Node %.40s reported node %.40s as not reachable.",
+                            sender->name, node->name);
+                    }
+                    markNodeAsFailingIfNeeded(node);
+                } else {
+                    if (clusterNodeDelFailureReport(node,sender)) {
+                        redisLog(REDIS_NOTICE,
+                            "Node %.40s reported node %.40s is back online.",
+                            sender->name, node->name);
+                    }
+                }
             }
         } else {
             /* If it's not in NOADDR state and we don't have it, we
@@ -534,7 +764,7 @@ int clusterProcessPacket(clusterLink *link) {
     sender = clusterLookupNode(hdr->sender);
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
         int update_config = 0;
-        redisLog(REDIS_DEBUG,"Ping packet received: %p", link->node);
+        redisLog(REDIS_DEBUG,"Ping packet received: %p", (void*)link->node);
 
         /* Add this node if it is new for us and the msg type is MEET.
          * In this stage we don't try to add the node with the right
@@ -562,7 +792,7 @@ int clusterProcessPacket(clusterLink *link) {
         int update_state = 0;
         int update_config = 0;
 
-        redisLog(REDIS_DEBUG,"Pong packet received: %p", link->node);
+        redisLog(REDIS_DEBUG,"Pong packet received: %p", (void*)link->node);
         if (link->node) {
             if (link->node->flags & REDIS_NODE_HANDSHAKE) {
                 /* If we already have this node, try to change the
@@ -590,6 +820,8 @@ int clusterProcessPacket(clusterLink *link) {
                  * address. */
                 redisLog(REDIS_DEBUG,"PONG contains mismatching sender ID");
                 link->node->flags |= REDIS_NODE_NOADDR;
+                link->node->ip[0] = '\0';
+                link->node->port = 0;
                 freeClusterLink(link);
                 update_config = 1;
                 /* FIXME: remove this node if we already have it.
@@ -621,24 +853,31 @@ int clusterProcessPacket(clusterLink *link) {
             }
         }
 
-        /* Update our info about served slots if this new node is serving
-         * slots that are not served from our point of view. */
+        /* Update our info about served slots. */
         if (sender && sender->flags & REDIS_NODE_MASTER) {
-            int newslots, j;
+            int changes, j;
 
-            newslots =
+            changes =
                 memcmp(sender->slots,hdr->myslots,sizeof(hdr->myslots)) != 0;
-            memcpy(sender->slots,hdr->myslots,sizeof(hdr->myslots));
-            if (newslots) {
+            if (changes) {
                 for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) {
-                    if (clusterNodeGetSlotBit(sender,j)) {
-                        if (server.cluster.slots[j] == sender) continue;
-                        if (server.cluster.slots[j] == NULL ||
-                            server.cluster.slots[j]->flags & REDIS_NODE_FAIL)
+                    if (bitmapTestBit(hdr->myslots,j)) {
+                        /* If this slot was not served, or served by a node
+                         * in FAIL state, update the table with the new node
+                         * caliming to serve the slot. */
+                        if (server.cluster->slots[j] == sender) continue;
+                        if (server.cluster->slots[j] == NULL ||
+                            server.cluster->slots[j]->flags & REDIS_NODE_FAIL)
                         {
-                            server.cluster.slots[j] = sender;
+                            clusterDelSlot(j);
+                            clusterAddSlot(sender,j);
                             update_state = update_config = 1;
                         }
+                    } else {
+                        /* This node claims to no longer handling the slot,
+                         * however we don't change our config as this is likely
+                         * happening because a resharding is in progress, and
+                         * it already knows where to redirect clients. */
                     }
                 }
             }
@@ -707,7 +946,7 @@ void clusterWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     nwritten = write(fd, link->sndbuf, sdslen(link->sndbuf));
     if (nwritten <= 0) {
-        redisLog(REDIS_NOTICE,"I/O error writing to node link: %s",
+        redisLog(REDIS_DEBUG,"I/O error writing to node link: %s",
             strerror(errno));
         handleLinkIOError(link);
         return;
@@ -721,28 +960,41 @@ void clusterWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
  * full length of the packet. When a whole packet is in memory this function
  * will call the function to process the packet. And so forth. */
 void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
-    char buf[1024];
+    char buf[4096];
     ssize_t nread;
     clusterMsg *hdr;
     clusterLink *link = (clusterLink*) privdata;
-    int readlen;
+    int readlen, rcvbuflen;
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(mask);
 
 again:
-    if (sdslen(link->rcvbuf) >= 4) {
-        hdr = (clusterMsg*) link->rcvbuf;
-        readlen = ntohl(hdr->totlen) - sdslen(link->rcvbuf);
+    rcvbuflen = sdslen(link->rcvbuf);
+    if (rcvbuflen < 4) {
+        /* First, obtain the first four bytes to get the full message
+         * length. */
+        readlen = 4 - rcvbuflen;
     } else {
-        readlen = 4 - sdslen(link->rcvbuf);
+        /* Finally read the full message. */
+        hdr = (clusterMsg*) link->rcvbuf;
+        if (rcvbuflen == 4) {
+            /* Perform some sanity check on the message length. */
+            if (ntohl(hdr->totlen) < CLUSTERMSG_MIN_LEN) {
+                redisLog(REDIS_WARNING,
+                    "Bad message length received from Cluster bus.");
+                handleLinkIOError(link);
+                return;
+            }
+        }
+        readlen = ntohl(hdr->totlen) - rcvbuflen;
     }
 
     nread = read(fd,buf,readlen);
-    if (nread == -1 && errno == EAGAIN) return; /* Just no data */
+    if (nread == -1 && errno == EAGAIN) return; /* No more data ready. */
 
     if (nread <= 0) {
         /* I/O error... */
-        redisLog(REDIS_NOTICE,"I/O error reading from node link: %s",
+        redisLog(REDIS_DEBUG,"I/O error reading from node link: %s",
             (nread == 0) ? "connection closed" : strerror(errno));
         handleLinkIOError(link);
         return;
@@ -750,17 +1002,19 @@ again:
         /* Read data and recast the pointer to the new buffer. */
         link->rcvbuf = sdscatlen(link->rcvbuf,buf,nread);
         hdr = (clusterMsg*) link->rcvbuf;
+        rcvbuflen += nread;
     }
 
     /* Total length obtained? read the payload now instead of burning
      * cycles waiting for a new event to fire. */
-    if (sdslen(link->rcvbuf) == 4) goto again;
+    if (rcvbuflen == 4) goto again;
 
     /* Whole packet in memory? We can process it. */
-    if (sdslen(link->rcvbuf) == ntohl(hdr->totlen)) {
+    if (rcvbuflen == ntohl(hdr->totlen)) {
         if (clusterProcessPacket(link)) {
             sdsfree(link->rcvbuf);
             link->rcvbuf = sdsempty();
+            rcvbuflen = 0; /* Useless line of code currently... defensive. */
         }
     }
 }
@@ -779,7 +1033,7 @@ void clusterBroadcastMessage(void *buf, size_t len) {
     dictIterator *di;
     dictEntry *de;
 
-    di = dictGetIterator(server.cluster.nodes);
+    di = dictGetIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
 
@@ -796,16 +1050,16 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
 
     memset(hdr,0,sizeof(*hdr));
     hdr->type = htons(type);
-    memcpy(hdr->sender,server.cluster.myself->name,REDIS_CLUSTER_NAMELEN);
-    memcpy(hdr->myslots,server.cluster.myself->slots,
+    memcpy(hdr->sender,server.cluster->myself->name,REDIS_CLUSTER_NAMELEN);
+    memcpy(hdr->myslots,server.cluster->myself->slots,
         sizeof(hdr->myslots));
     memset(hdr->slaveof,0,REDIS_CLUSTER_NAMELEN);
-    if (server.cluster.myself->slaveof != NULL) {
-        memcpy(hdr->slaveof,server.cluster.myself->slaveof->name,
+    if (server.cluster->myself->slaveof != NULL) {
+        memcpy(hdr->slaveof,server.cluster->myself->slaveof->name,
                                     REDIS_CLUSTER_NAMELEN);
     }
     hdr->port = htons(server.port);
-    hdr->state = server.cluster.state;
+    hdr->state = server.cluster->state;
     memset(hdr->configdigest,0,32); /* FIXME: set config digest */
 
     if (type == CLUSTERMSG_TYPE_FAIL) {
@@ -819,7 +1073,7 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
 /* Send a PING or PONG packet to the specified node, making sure to add enough
  * gossip informations. */
 void clusterSendPing(clusterLink *link, int type) {
-    unsigned char buf[1024];
+    unsigned char buf[4096];
     clusterMsg *hdr = (clusterMsg*) buf;
     int gossipcount = 0, totlen;
     /* freshnodes is the number of nodes we can still use to populate the
@@ -828,7 +1082,7 @@ void clusterSendPing(clusterLink *link, int type) {
      * message to). Every time we add a node we decrement the counter, so when
      * it will drop to <= zero we know there is no more gossip info we can
      * send. */
-    int freshnodes = dictSize(server.cluster.nodes)-2;
+    int freshnodes = dictSize(server.cluster->nodes)-2;
 
     if (link->node && type == CLUSTERMSG_TYPE_PING)
         link->node->ping_sent = time(NULL);
@@ -836,15 +1090,21 @@ void clusterSendPing(clusterLink *link, int type) {
         
     /* Populate the gossip fields */
     while(freshnodes > 0 && gossipcount < 3) {
-        struct dictEntry *de = dictGetRandomKey(server.cluster.nodes);
+        struct dictEntry *de = dictGetRandomKey(server.cluster->nodes);
         clusterNode *this = dictGetVal(de);
         clusterMsgDataGossip *gossip;
         int j;
 
-        /* Not interesting to gossip about ourself.
-         * Nor to send gossip info about HANDSHAKE state nodes (zero info). */
-        if (this == server.cluster.myself ||
-            this->flags & REDIS_NODE_HANDSHAKE) {
+        /* In the gossip section don't include:
+         * 1) Myself.
+         * 2) Nodes in HANDSHAKE state.
+         * 3) Nodes with the NOADDR flag set.
+         * 4) Disconnected nodes if they don't have configured slots.
+         */
+        if (this == server.cluster->myself ||
+            this->flags & (REDIS_NODE_HANDSHAKE|REDIS_NODE_NOADDR) ||
+            (this->link == NULL && this->numslots == 0))
+        {
                 freshnodes--; /* otherwise we may loop forever. */
                 continue;
         }
@@ -924,7 +1184,7 @@ void clusterSendPublish(clusterLink *link, robj *channel, robj *message) {
  * we switch the node state to REDIS_NODE_FAIL and ask all the other
  * nodes to do the same ASAP. */
 void clusterSendFail(char *nodename) {
-    unsigned char buf[1024];
+    unsigned char buf[4096];
     clusterMsg *hdr = (clusterMsg*) buf;
 
     clusterBuildMessageHdr(hdr,CLUSTERMSG_TYPE_FAIL);
@@ -955,8 +1215,8 @@ void clusterCron(void) {
     time_t min_ping_sent = 0;
     clusterNode *min_ping_node = NULL;
 
-    /* Check if we have disconnected nodes and reestablish the connection. */
-    di = dictGetIterator(server.cluster.nodes);
+    /* Check if we have disconnected nodes and re-establish the connection. */
+    di = dictGetIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
 
@@ -984,7 +1244,7 @@ void clusterCron(void) {
              * normal PING packets. */
             node->flags &= ~REDIS_NODE_MEET;
 
-            redisLog(REDIS_NOTICE,"Connecting with Node %.40s at %s:%d", node->name, node->ip, node->port+REDIS_CLUSTER_PORT_INCR);
+            redisLog(REDIS_DEBUG,"Connecting with Node %.40s at %s:%d", node->name, node->ip, node->port+REDIS_CLUSTER_PORT_INCR);
         }
     }
     dictReleaseIterator(di);
@@ -992,7 +1252,7 @@ void clusterCron(void) {
     /* Ping some random node. Check a few random nodes and ping the one with
      * the oldest ping_sent time */
     for (j = 0; j < 5; j++) {
-        de = dictGetRandomKey(server.cluster.nodes);
+        de = dictGetRandomKey(server.cluster->nodes);
         clusterNode *this = dictGetVal(de);
 
         if (this->link == NULL) continue;
@@ -1008,7 +1268,7 @@ void clusterCron(void) {
     }
 
     /* Iterate nodes to check if we need to flag something as failing */
-    di = dictGetIterator(server.cluster.nodes);
+    di = dictGetIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
         int delay;
@@ -1021,8 +1281,15 @@ void clusterCron(void) {
         if (node->ping_sent == 0 ||
             node->ping_sent <= node->pong_received) continue;
 
-        delay = time(NULL) - node->pong_received;
-        if (delay < server.cluster.node_timeout) {
+        /* If we never received a pong, use the ping time to compute
+         * the delay. */
+        if (node->pong_received) {
+            delay = time(NULL) - node->pong_received;
+        } else {
+            delay = time(NULL) - node->ping_sent;
+        }
+
+        if (delay < server.cluster->node_timeout) {
             /* The PFAIL condition can be reversed without external
              * help if it is not transitive (that is, if it does not
              * turn into a FAIL state).
@@ -1034,12 +1301,11 @@ void clusterCron(void) {
              * FAIL node. */
             if (node->flags & REDIS_NODE_PFAIL) {
                 node->flags &= ~REDIS_NODE_PFAIL;
-            } else if (node->flags & REDIS_NODE_FAIL && !node->numslaves) {
-                node->flags &= ~REDIS_NODE_FAIL;
-                clusterUpdateState();
+            } else if (node->flags & REDIS_NODE_FAIL) {
+                clearNodeFailureIfNeeded(node);
             }
         } else {
-            /* Timeout reached. Set the noad se possibly failing if it is
+            /* Timeout reached. Set the node as possibly failing if it is
              * not already in this state. */
             if (!(node->flags & (REDIS_NODE_PFAIL|REDIS_NODE_FAIL))) {
                 redisLog(REDIS_DEBUG,"*** NODE %.40s possibly failing",
@@ -1055,29 +1321,47 @@ void clusterCron(void) {
  * Slots management
  * -------------------------------------------------------------------------- */
 
+/* Test bit 'pos' in a generic bitmap. Return 1 if the bit is zet,
+ * otherwise 0. */
+int bitmapTestBit(unsigned char *bitmap, int pos) {
+    off_t byte = pos/8;
+    int bit = pos&7;
+    return (bitmap[byte] & (1<<bit)) != 0;
+}
+
+/* Set the bit at position 'pos' in a bitmap. */
+void bitmapSetBit(unsigned char *bitmap, int pos) {
+    off_t byte = pos/8;
+    int bit = pos&7;
+    bitmap[byte] |= 1<<bit;
+}
+
+/* Clear the bit at position 'pos' in a bitmap. */
+void bitmapClearBit(unsigned char *bitmap, int pos) {
+    off_t byte = pos/8;
+    int bit = pos&7;
+    bitmap[byte] &= ~(1<<bit);
+}
+
 /* Set the slot bit and return the old value. */
 int clusterNodeSetSlotBit(clusterNode *n, int slot) {
-    off_t byte = slot/8;
-    int bit = slot&7;
-    int old = (n->slots[byte] & (1<<bit)) != 0;
-    n->slots[byte] |= 1<<bit;
+    int old = bitmapTestBit(n->slots,slot);
+    bitmapSetBit(n->slots,slot);
+    if (!old) n->numslots++;
     return old;
 }
 
 /* Clear the slot bit and return the old value. */
 int clusterNodeClearSlotBit(clusterNode *n, int slot) {
-    off_t byte = slot/8;
-    int bit = slot&7;
-    int old = (n->slots[byte] & (1<<bit)) != 0;
-    n->slots[byte] &= ~(1<<bit);
+    int old = bitmapTestBit(n->slots,slot);
+    bitmapClearBit(n->slots,slot);
+    if (old) n->numslots--;
     return old;
 }
 
 /* Return the slot bit from the cluster node structure. */
 int clusterNodeGetSlotBit(clusterNode *n, int slot) {
-    off_t byte = slot/8;
-    int bit = slot&7;
-    return (n->slots[byte] & (1<<bit)) != 0;
+    return bitmapTestBit(n->slots,slot);
 }
 
 /* Add the specified slot to the list of slots that node 'n' will
@@ -1085,9 +1369,9 @@ int clusterNodeGetSlotBit(clusterNode *n, int slot) {
  * If the slot is already assigned to another instance this is considered
  * an error and REDIS_ERR is returned. */
 int clusterAddSlot(clusterNode *n, int slot) {
-    if (clusterNodeSetSlotBit(n,slot) != 0)
-        return REDIS_ERR;
-    server.cluster.slots[slot] = n;
+    if (server.cluster->slots[slot]) return REDIS_ERR;
+    clusterNodeSetSlotBit(n,slot);
+    server.cluster->slots[slot] = n;
     return REDIS_OK;
 }
 
@@ -1095,11 +1379,11 @@ int clusterAddSlot(clusterNode *n, int slot) {
  * Returns REDIS_OK if the slot was assigned, otherwise if the slot was
  * already unassigned REDIS_ERR is returned. */
 int clusterDelSlot(int slot) {
-    clusterNode *n = server.cluster.slots[slot];
+    clusterNode *n = server.cluster->slots[slot];
 
     if (!n) return REDIS_ERR;
     redisAssert(clusterNodeClearSlotBit(n,slot) == 1);
-    server.cluster.slots[slot] = NULL;
+    server.cluster->slots[slot] = NULL;
     return REDIS_OK;
 }
 
@@ -1110,23 +1394,106 @@ void clusterUpdateState(void) {
     int ok = 1;
     int j;
 
+    /* Check if all the slots are covered. */
     for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) {
-        if (server.cluster.slots[j] == NULL ||
-            server.cluster.slots[j]->flags & (REDIS_NODE_FAIL))
+        if (server.cluster->slots[j] == NULL ||
+            server.cluster->slots[j]->flags & (REDIS_NODE_FAIL))
         {
             ok = 0;
             break;
         }
     }
+
+    /* Update cluster->state accordingly. */
     if (ok) {
-        if (server.cluster.state == REDIS_CLUSTER_NEEDHELP) {
-            server.cluster.state = REDIS_CLUSTER_NEEDHELP;
+        if (server.cluster->state == REDIS_CLUSTER_NEEDHELP) {
+            server.cluster->state = REDIS_CLUSTER_NEEDHELP;
         } else {
-            server.cluster.state = REDIS_CLUSTER_OK;
+            server.cluster->state = REDIS_CLUSTER_OK;
         }
     } else {
-        server.cluster.state = REDIS_CLUSTER_FAIL;
+        server.cluster->state = REDIS_CLUSTER_FAIL;
     }
+
+    /* Compute the cluster size, that is the number of master nodes
+     * serving at least a single slot. */
+    {
+        dictIterator *di;
+        dictEntry *de;
+
+        server.cluster->size = 0;
+        di = dictGetIterator(server.cluster->nodes);
+        while((de = dictNext(di)) != NULL) {
+            clusterNode *node = dictGetVal(de);
+
+            if (node->flags & REDIS_NODE_MASTER && node->numslots)
+                server.cluster->size++;
+        }
+        dictReleaseIterator(di);
+    }
+}
+
+/* This function is called after the node startup in order to verify that data
+ * loaded from disk is in agreement with the cluster configuration:
+ *
+ * 1) If we find keys about hash slots we have no responsibility for, the
+ *    following happens:
+ *    A) If no other node is in charge according to the current cluster
+ *       configuration, we add these slots to our node.
+ *    B) If according to our config other nodes are already in charge for
+ *       this lots, we set the slots as IMPORTING from our point of view
+ *       in order to justify we have those slots, and in order to make
+ *       redis-trib aware of the issue, so that it can try to fix it.
+ * 2) If we find data in a DB different than DB0 we return REDIS_ERR to
+ *    signal the caller it should quit the server with an error message
+ *    or take other actions.
+ *
+ * The function always returns REDIS_OK even if it will try to correct
+ * the error described in "1". However if data is found in DB different
+ * from DB0, REDIS_ERR is returned.
+ *
+ * The function also uses the logging facility in order to warn the user
+ * about desynchronizations between the data we have in memory and the
+ * cluster configuration. */
+int verifyClusterConfigWithData(void) {
+    int j;
+    int update_config = 0;
+
+    /* Make sure we only have keys in DB0. */
+    for (j = 1; j < server.dbnum; j++) {
+        if (dictSize(server.db[j].dict)) return REDIS_ERR;
+    }
+
+    /* Check that all the slots we see populated memory have a corresponding
+     * entry in the cluster table. Otherwise fix the table. */
+    for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) {
+        if (!countKeysInSlot(j)) continue; /* No keys in this slot. */
+        /* Check if we are assigned to this slot or if we are importing it.
+         * In both cases check the next slot as the configuration makes
+         * sense. */
+        if (server.cluster->slots[j] == server.cluster->myself ||
+            server.cluster->importing_slots_from[j] != NULL) continue;
+
+        /* If we are here data and cluster config don't agree, and we have
+         * slot 'j' populated even if we are not importing it, nor we are
+         * assigned to this slot. Fix this condition. */
+
+        update_config++;
+        /* Case A: slot is unassigned. Take responsability for it. */
+        if (server.cluster->slots[j] == NULL) {
+            redisLog(REDIS_WARNING, "I've keys about slot %d that is "
+                                    "unassigned. Taking responsability "
+                                    "for it.",j);
+            clusterAddSlot(server.cluster->myself,j);
+        } else {
+            redisLog(REDIS_WARNING, "I've keys about slot %d that is "
+                                    "already assigned to a different node. "
+                                    "Setting it in importing state.",j);
+            server.cluster->importing_slots_from[j] = server.cluster->slots[j];
+        }
+    }
+    if (update_config) clusterSaveConfigOrDie();
+    return REDIS_OK;
 }
 
 /* -----------------------------------------------------------------------------
@@ -1139,7 +1506,7 @@ sds clusterGenNodesDescription(void) {
     dictEntry *de;
     int j, start;
 
-    di = dictGetIterator(server.cluster.nodes);
+    di = dictGetIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
 
@@ -1198,12 +1565,12 @@ sds clusterGenNodesDescription(void) {
          * instances. */
         if (node->flags & REDIS_NODE_MYSELF) {
             for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) {
-                if (server.cluster.migrating_slots_to[j]) {
+                if (server.cluster->migrating_slots_to[j]) {
                     ci = sdscatprintf(ci," [%d->-%.40s]",j,
-                        server.cluster.migrating_slots_to[j]->name);
-                } else if (server.cluster.importing_slots_from[j]) {
+                        server.cluster->migrating_slots_to[j]->name);
+                } else if (server.cluster->importing_slots_from[j]) {
                     ci = sdscatprintf(ci," [%d-<-%.40s]",j,
-                        server.cluster.importing_slots_from[j]->name);
+                        server.cluster->importing_slots_from[j]->name);
                 }
             }
         }
@@ -1232,6 +1599,7 @@ void clusterCommand(redisClient *c) {
     }
 
     if (!strcasecmp(c->argv[1]->ptr,"meet") && c->argc == 4) {
+        /* CLUSTER MEET <ip> <port> */
         clusterNode *n;
         struct sockaddr_in sa;
         long port;
@@ -1256,6 +1624,7 @@ void clusterCommand(redisClient *c) {
         clusterAddNode(n);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"nodes") && c->argc == 2) {
+        /* CLUSTER NODES */
         robj *o;
         sds ci = clusterGenNodesDescription();
 
@@ -1279,11 +1648,11 @@ void clusterCommand(redisClient *c) {
                 zfree(slots);
                 return;
             }
-            if (del && server.cluster.slots[slot] == NULL) {
+            if (del && server.cluster->slots[slot] == NULL) {
                 addReplyErrorFormat(c,"Slot %d is already unassigned", slot);
                 zfree(slots);
                 return;
-            } else if (!del && server.cluster.slots[slot]) {
+            } else if (!del && server.cluster->slots[slot]) {
                 addReplyErrorFormat(c,"Slot %d is already busy", slot);
                 zfree(slots);
                 return;
@@ -1301,11 +1670,11 @@ void clusterCommand(redisClient *c) {
 
                 /* If this slot was set as importing we can clear this 
                  * state as now we are the real owner of the slot. */
-                if (server.cluster.importing_slots_from[j])
-                    server.cluster.importing_slots_from[j] = NULL;
+                if (server.cluster->importing_slots_from[j])
+                    server.cluster->importing_slots_from[j] = NULL;
 
                 retval = del ? clusterDelSlot(j) :
-                               clusterAddSlot(server.cluster.myself,j);
+                               clusterAddSlot(server.cluster->myself,j);
                 redisAssertWithInfo(c,NULL,retval == REDIS_OK);
             }
         }
@@ -1324,7 +1693,7 @@ void clusterCommand(redisClient *c) {
         if ((slot = getSlotOrReply(c,c->argv[2])) == -1) return;
 
         if (!strcasecmp(c->argv[3]->ptr,"migrating") && c->argc == 5) {
-            if (server.cluster.slots[slot] != server.cluster.myself) {
+            if (server.cluster->slots[slot] != server.cluster->myself) {
                 addReplyErrorFormat(c,"I'm not the owner of hash slot %u",slot);
                 return;
             }
@@ -1333,9 +1702,9 @@ void clusterCommand(redisClient *c) {
                     (char*)c->argv[4]->ptr);
                 return;
             }
-            server.cluster.migrating_slots_to[slot] = n;
+            server.cluster->migrating_slots_to[slot] = n;
         } else if (!strcasecmp(c->argv[3]->ptr,"importing") && c->argc == 5) {
-            if (server.cluster.slots[slot] == server.cluster.myself) {
+            if (server.cluster->slots[slot] == server.cluster->myself) {
                 addReplyErrorFormat(c,
                     "I'm already the owner of hash slot %u",slot);
                 return;
@@ -1345,29 +1714,26 @@ void clusterCommand(redisClient *c) {
                     (char*)c->argv[3]->ptr);
                 return;
             }
-            server.cluster.importing_slots_from[slot] = n;
+            server.cluster->importing_slots_from[slot] = n;
         } else if (!strcasecmp(c->argv[3]->ptr,"stable") && c->argc == 4) {
             /* CLUSTER SETSLOT <SLOT> STABLE */
-            server.cluster.importing_slots_from[slot] = NULL;
-            server.cluster.migrating_slots_to[slot] = NULL;
+            server.cluster->importing_slots_from[slot] = NULL;
+            server.cluster->migrating_slots_to[slot] = NULL;
         } else if (!strcasecmp(c->argv[3]->ptr,"node") && c->argc == 5) {
             /* CLUSTER SETSLOT <SLOT> NODE <NODE ID> */
             clusterNode *n = clusterLookupNode(c->argv[4]->ptr);
 
-            if (!n) addReplyErrorFormat(c,"Unknown node %s",
-                (char*)c->argv[4]->ptr);
+            if (!n) {
+                addReplyErrorFormat(c,"Unknown node %s",
+                    (char*)c->argv[4]->ptr);
+                return;
+            }
             /* If this hash slot was served by 'myself' before to switch
              * make sure there are no longer local keys for this hash slot. */
-            if (server.cluster.slots[slot] == server.cluster.myself &&
-                n != server.cluster.myself)
+            if (server.cluster->slots[slot] == server.cluster->myself &&
+                n != server.cluster->myself)
             {
-                int numkeys;
-                robj **keys;
-
-                keys = zmalloc(sizeof(robj*)*1);
-                numkeys = GetKeysInSlot(slot, keys, 1);
-                zfree(keys);
-                if (numkeys != 0) {
+                if (countKeysInSlot(slot) != 0) {
                     addReplyErrorFormat(c, "Can't assign hashslot %d to a different node while I still hold keys for this hash slot.", slot);
                     return;
                 }
@@ -1375,30 +1741,32 @@ void clusterCommand(redisClient *c) {
             /* If this node was the slot owner and the slot was marked as
              * migrating, assigning the slot to another node will clear
              * the migratig status. */
-            if (server.cluster.slots[slot] == server.cluster.myself &&
-                server.cluster.migrating_slots_to[slot])
-                server.cluster.migrating_slots_to[slot] = NULL;
+            if (server.cluster->slots[slot] == server.cluster->myself &&
+                server.cluster->migrating_slots_to[slot])
+                server.cluster->migrating_slots_to[slot] = NULL;
 
             /* If this node was importing this slot, assigning the slot to
              * itself also clears the importing status. */
-            if (n == server.cluster.myself && server.cluster.importing_slots_from[slot])
-                server.cluster.importing_slots_from[slot] = NULL;
-
+            if (n == server.cluster->myself &&
+                server.cluster->importing_slots_from[slot])
+                server.cluster->importing_slots_from[slot] = NULL;
             clusterDelSlot(slot);
             clusterAddSlot(n,slot);
         } else {
             addReplyError(c,"Invalid CLUSTER SETSLOT action or number of arguments");
             return;
         }
+        clusterUpdateState();
         clusterSaveConfigOrDie();
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"info") && c->argc == 2) {
+        /* CLUSTER INFO */
         char *statestr[] = {"ok","fail","needhelp"};
         int slots_assigned = 0, slots_ok = 0, slots_pfail = 0, slots_fail = 0;
         int j;
 
         for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) {
-            clusterNode *n = server.cluster.slots[j];
+            clusterNode *n = server.cluster->slots[j];
 
             if (n == NULL) continue;
             slots_assigned++;
@@ -1418,22 +1786,37 @@ void clusterCommand(redisClient *c) {
             "cluster_slots_pfail:%d\r\n"
             "cluster_slots_fail:%d\r\n"
             "cluster_known_nodes:%lu\r\n"
-            , statestr[server.cluster.state],
+            "cluster_size:%d\r\n"
+            , statestr[server.cluster->state],
             slots_assigned,
             slots_ok,
             slots_pfail,
             slots_fail,
-            dictSize(server.cluster.nodes)
+            dictSize(server.cluster->nodes),
+            server.cluster->size
         );
         addReplySds(c,sdscatprintf(sdsempty(),"$%lu\r\n",
             (unsigned long)sdslen(info)));
         addReplySds(c,info);
         addReply(c,shared.crlf);
     } else if (!strcasecmp(c->argv[1]->ptr,"keyslot") && c->argc == 3) {
+        /* CLUSTER KEYSLOT <key> */
         sds key = c->argv[2]->ptr;
 
         addReplyLongLong(c,keyHashSlot(key,sdslen(key)));
+    } else if (!strcasecmp(c->argv[1]->ptr,"countkeysinslot") && c->argc == 3) {
+        /* CLUSTER COUNTKEYSINSLOT <slot> */
+        long long slot;
+
+        if (getLongLongFromObjectOrReply(c,c->argv[2],&slot,NULL) != REDIS_OK)
+            return;
+        if (slot < 0 || slot >= REDIS_CLUSTER_SLOTS) {
+            addReplyError(c,"Invalid slot");
+            return;
+        }
+        addReplyLongLong(c,countKeysInSlot(slot));
     } else if (!strcasecmp(c->argv[1]->ptr,"getkeysinslot") && c->argc == 4) {
+        /* CLUSTER GETKEYSINSLOT <slot> <count> */
         long long maxkeys, slot;
         unsigned int numkeys, j;
         robj **keys;
@@ -1442,17 +1825,28 @@ void clusterCommand(redisClient *c) {
             return;
         if (getLongLongFromObjectOrReply(c,c->argv[3],&maxkeys,NULL) != REDIS_OK)
             return;
-        if (slot < 0 || slot >= REDIS_CLUSTER_SLOTS || maxkeys < 0 ||
-            maxkeys > 1024*1024) {
+        if (slot < 0 || slot >= REDIS_CLUSTER_SLOTS || maxkeys < 0) {
             addReplyError(c,"Invalid slot or number of keys");
             return;
         }
 
         keys = zmalloc(sizeof(robj*)*maxkeys);
-        numkeys = GetKeysInSlot(slot, keys, maxkeys);
+        numkeys = getKeysInSlot(slot, keys, maxkeys);
         addReplyMultiBulkLen(c,numkeys);
         for (j = 0; j < numkeys; j++) addReplyBulk(c,keys[j]);
         zfree(keys);
+    } else if (!strcasecmp(c->argv[1]->ptr,"forget") && c->argc == 3) {
+        /* CLUSTER FORGET <NODE ID> */
+        clusterNode *n = clusterLookupNode(c->argv[2]->ptr);
+
+        if (!n) {
+            addReplyErrorFormat(c,"Unknown node %s", (char*)c->argv[2]->ptr);
+            return;
+        }
+        clusterDelNode(n);
+        clusterUpdateState();
+        clusterSaveConfigOrDie();
+        addReply(c,shared.ok);
     } else {
         addReplyError(c,"Wrong CLUSTER subcommand or number of arguments");
     }
@@ -1539,15 +1933,25 @@ void dumpCommand(redisClient *c) {
     return;
 }
 
-/* RESTORE key ttl serialized-value */
+/* RESTORE key ttl serialized-value [REPLACE] */
 void restoreCommand(redisClient *c) {
     long ttl;
     rio payload;
-    int type;
+    int j, type, replace = 0;
     robj *obj;
 
+    /* Parse additional options */
+    for (j = 4; j < c->argc; j++) {
+        if (!strcasecmp(c->argv[j]->ptr,"replace")) {
+            replace = 1;
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
     /* Make sure this key does not already exist here... */
-    if (lookupKeyWrite(c->db,c->argv[1]) != NULL) {
+    if (!replace && lookupKeyWrite(c->db,c->argv[1]) != NULL) {
         addReplyError(c,"Target key name is busy.");
         return;
     }
@@ -1574,6 +1978,9 @@ void restoreCommand(redisClient *c) {
         return;
     }
 
+    /* Remove the old key if needed. */
+    if (replace) dbDelete(c->db,c->argv[1]);
+
     /* Create the key and set the TTL if any */
     dbAdd(c->db,c->argv[1],obj);
     if (ttl) setExpire(c->db,c->argv[1],mstime()+ttl);
@@ -1582,21 +1989,154 @@ void restoreCommand(redisClient *c) {
     server.dirty++;
 }
 
-/* MIGRATE host port key dbid timeout */
-void migrateCommand(redisClient *c) {
+/* MIGRATE socket cache implementation.
+ *
+ * We take a map between host:ip and a TCP socket that we used to connect
+ * to this instance in recent time.
+ * This sockets are closed when the max number we cache is reached, and also
+ * in serverCron() when they are around for more than a few seconds. */
+#define MIGRATE_SOCKET_CACHE_ITEMS 64 /* max num of items in the cache. */
+#define MIGRATE_SOCKET_CACHE_TTL 10 /* close cached socekts after 10 sec. */
+
+typedef struct migrateCachedSocket {
     int fd;
+    time_t last_use_time;
+} migrateCachedSocket;
+
+/* Return a TCP scoket connected with the target instance, possibly returning
+ * a cached one.
+ *
+ * This function is responsible of sending errors to the client if a
+ * connection can't be established. In this case -1 is returned.
+ * Otherwise on success the socket is returned, and the caller should not
+ * attempt to free it after usage.
+ *
+ * If the caller detects an error while using the socket, migrateCloseSocket()
+ * should be called so that the connection will be craeted from scratch
+ * the next time. */
+int migrateGetSocket(redisClient *c, robj *host, robj *port, long timeout) {
+    int fd;
+    sds name = sdsempty();
+    migrateCachedSocket *cs;
+
+    /* Check if we have an already cached socket for this ip:port pair. */
+    name = sdscatlen(name,host->ptr,sdslen(host->ptr));
+    name = sdscatlen(name,":",1);
+    name = sdscatlen(name,port->ptr,sdslen(port->ptr));
+    cs = dictFetchValue(server.migrate_cached_sockets,name);
+    if (cs) {
+        sdsfree(name);
+        cs->last_use_time = server.unixtime;
+        return cs->fd;
+    }
+
+    /* No cached socket, create one. */
+    if (dictSize(server.migrate_cached_sockets) == MIGRATE_SOCKET_CACHE_ITEMS) {
+        /* Too many items, drop one at random. */
+        dictEntry *de = dictGetRandomKey(server.migrate_cached_sockets);
+        cs = dictGetVal(de);
+        close(cs->fd);
+        zfree(cs);
+        dictDelete(server.migrate_cached_sockets,dictGetKey(de));
+    }
+
+    /* Create the socket */
+    fd = anetTcpNonBlockConnect(server.neterr,c->argv[1]->ptr,
+                atoi(c->argv[2]->ptr));
+    if (fd == -1) {
+        sdsfree(name);
+        addReplyErrorFormat(c,"Can't connect to target node: %s",
+            server.neterr);
+        return -1;
+    }
+    anetEnableTcpNoDelay(server.neterr,fd);
+
+    /* Check if it connects within the specified timeout. */
+    if ((aeWait(fd,AE_WRITABLE,timeout) & AE_WRITABLE) == 0) {
+        sdsfree(name);
+        addReplySds(c,sdsnew("-IOERR error or timeout connecting to the client\r\n"));
+        close(fd);
+        return -1;
+    }
+
+    /* Add to the cache and return it to the caller. */
+    cs = zmalloc(sizeof(*cs));
+    cs->fd = fd;
+    cs->last_use_time = server.unixtime;
+    dictAdd(server.migrate_cached_sockets,name,cs);
+    return fd;
+}
+
+/* Free a migrate cached connection. */
+void migrateCloseSocket(robj *host, robj *port) {
+    sds name = sdsempty();
+    migrateCachedSocket *cs;
+
+    name = sdscatlen(name,host->ptr,sdslen(host->ptr));
+    name = sdscatlen(name,":",1);
+    name = sdscatlen(name,port->ptr,sdslen(port->ptr));
+    cs = dictFetchValue(server.migrate_cached_sockets,name);
+    if (!cs) {
+        sdsfree(name);
+        return;
+    }
+
+    close(cs->fd);
+    zfree(cs);
+    dictDelete(server.migrate_cached_sockets,name);
+    sdsfree(name);
+}
+
+void migrateCloseTimedoutSockets(void) {
+    dictIterator *di = dictGetSafeIterator(server.migrate_cached_sockets);
+    dictEntry *de;
+
+    while((de = dictNext(di)) != NULL) {
+        migrateCachedSocket *cs = dictGetVal(de);
+
+        if ((server.unixtime - cs->last_use_time) > MIGRATE_SOCKET_CACHE_TTL) {
+            close(cs->fd);
+            zfree(cs);
+            dictDelete(server.migrate_cached_sockets,dictGetKey(de));
+        }
+    }
+    dictReleaseIterator(di);
+}
+
+/* MIGRATE host port key dbid timeout [COPY | REPLACE] */
+void migrateCommand(redisClient *c) {
+    int fd, copy, replace, j;
     long timeout;
     long dbid;
-    long long ttl = 0, expireat;
+    long long ttl, expireat;
     robj *o;
     rio cmd, payload;
+    int retry_num = 0;
+
+try_again:
+    /* Initialization */
+    copy = 0;
+    replace = 0;
+    ttl = 0;
+
+    /* Parse additional options */
+    for (j = 6; j < c->argc; j++) {
+        if (!strcasecmp(c->argv[j]->ptr,"copy")) {
+            copy = 1;
+        } else if (!strcasecmp(c->argv[j]->ptr,"replace")) {
+            replace = 1;
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
 
     /* Sanity check */
     if (getLongFromObjectOrReply(c,c->argv[5],&timeout,NULL) != REDIS_OK)
         return;
     if (getLongFromObjectOrReply(c,c->argv[4],&dbid,NULL) != REDIS_OK)
         return;
-    if (timeout <= 0) timeout = 1;
+    if (timeout <= 0) timeout = 1000;
 
     /* Check if the key is here. If not we reply with success as there is
      * nothing to migrate (for instance the key expired in the meantime), but
@@ -1607,17 +2147,8 @@ void migrateCommand(redisClient *c) {
     }
     
     /* Connect */
-    fd = anetTcpNonBlockConnect(server.neterr,c->argv[1]->ptr,
-                atoi(c->argv[2]->ptr));
-    if (fd == -1) {
-        addReplyErrorFormat(c,"Can't connect to target node: %s",
-            server.neterr);
-        return;
-    }
-    if ((aeWait(fd,AE_WRITABLE,timeout*1000) & AE_WRITABLE) == 0) {
-        addReplySds(c,sdsnew("-IOERR error or timeout connecting to the client\r\n"));
-        return;
-    }
+    fd = migrateGetSocket(c,c->argv[1],c->argv[2],timeout);
+    if (fd == -1) return; /* error sent to the client by migrateGetSocket() */
 
     /* Create RESTORE payload and generate the protocol to call the command. */
     rioInitWithBuffer(&cmd,sdsempty());
@@ -1630,20 +2161,30 @@ void migrateCommand(redisClient *c) {
         ttl = expireat-mstime();
         if (ttl < 1) ttl = 1;
     }
-    redisAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',4));
-    redisAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"RESTORE",7));
+    redisAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',replace ? 5 : 4));
+    if (server.cluster_enabled)
+        redisAssertWithInfo(c,NULL,
+            rioWriteBulkString(&cmd,"RESTORE-ASKING",14));
+    else
+        redisAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"RESTORE",7));
     redisAssertWithInfo(c,NULL,c->argv[3]->encoding == REDIS_ENCODING_RAW);
     redisAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,c->argv[3]->ptr,sdslen(c->argv[3]->ptr)));
     redisAssertWithInfo(c,NULL,rioWriteBulkLongLong(&cmd,ttl));
 
-    /* Finally the last argument that is the serailized object payload
-     * in the DUMP format. */
+    /* Emit the payload argument, that is the serialized object using
+     * the DUMP format. */
     createDumpPayload(&payload,o);
     redisAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,payload.io.buffer.ptr,
                                 sdslen(payload.io.buffer.ptr)));
     sdsfree(payload.io.buffer.ptr);
 
-    /* Tranfer the query to the other node in 64K chunks. */
+    /* Add the REPLACE option to the RESTORE command if it was specified
+     * as a MIGRATE option. */
+    if (replace)
+        redisAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"REPLACE",7));
+
+    /* Transfer the query to the other node in 64K chunks. */
+    errno = 0;
     {
         sds buf = cmd.io.buffer.ptr;
         size_t pos = 0, towrite;
@@ -1673,8 +2214,11 @@ void migrateCommand(redisClient *c) {
         } else {
             robj *aux;
 
-            dbDelete(c->db,c->argv[3]);
-            signalModifiedKey(c->db,c->argv[3]);
+            if (!copy) {
+                /* No COPY option: remove the local key, signal the change. */
+                dbDelete(c->db,c->argv[3]);
+                signalModifiedKey(c->db,c->argv[3]);
+            }
             addReply(c,shared.ok);
             server.dirty++;
 
@@ -1686,24 +2230,27 @@ void migrateCommand(redisClient *c) {
     }
 
     sdsfree(cmd.io.buffer.ptr);
-    close(fd);
     return;
 
 socket_wr_err:
-    addReplySds(c,sdsnew("-IOERR error or timeout writing to target instance\r\n"));
     sdsfree(cmd.io.buffer.ptr);
-    close(fd);
+    migrateCloseSocket(c->argv[1],c->argv[2]);
+    if (errno != ETIMEDOUT && retry_num++ == 0) goto try_again;
+    addReplySds(c,
+        sdsnew("-IOERR error or timeout writing to target instance\r\n"));
     return;
 
 socket_rd_err:
-    addReplySds(c,sdsnew("-IOERR error or timeout reading from target node\r\n"));
     sdsfree(cmd.io.buffer.ptr);
-    close(fd);
+    migrateCloseSocket(c->argv[1],c->argv[2]);
+    if (errno != ETIMEDOUT && retry_num++ == 0) goto try_again;
+    addReplySds(c,
+        sdsnew("-IOERR error or timeout reading from target node\r\n"));
     return;
 }
 
 /* The ASKING command is required after a -ASK redirection.
- * The client should issue ASKING before to actualy send the command to
+ * The client should issue ASKING before to actually send the command to
  * the target instance. See the Redis Cluster specification for more
  * information. */
 void askingCommand(redisClient *c) {
@@ -1719,16 +2266,16 @@ void askingCommand(redisClient *c) {
  * Cluster functions related to serving / redirecting clients
  * -------------------------------------------------------------------------- */
 
-/* Return the pointer to the cluster node that is able to serve the query
- * as all the keys belong to hash slots for which the node is in charge.
+/* Return the pointer to the cluster node that is able to serve the command.
+ * For the function to succeed the command should only target a single
+ * key (or the same key multiple times).
  *
  * If the returned node should be used only for this request, the *ask
  * integer is set to '1', otherwise to '0'. This is used in order to
  * let the caller know if we should reply with -MOVED or with -ASK.
  *
- * If the request contains more than a single key NULL is returned,
- * however a request with more then a key argument where the key is always
- * the same is valid, like in: RPOPLPUSH mylist mylist.*/
+ * If the command contains multiple keys, and as a consequence it is not
+ * possible to handle the request in Redis Cluster, NULL is returned. */
 clusterNode *getNodeByQuery(redisClient *c, struct redisCommand *cmd, robj **argv, int argc, int *hashslot, int *ask) {
     clusterNode *n = NULL;
     robj *firstkey = NULL;
@@ -1741,7 +2288,7 @@ clusterNode *getNodeByQuery(redisClient *c, struct redisCommand *cmd, robj **arg
     if (cmd->proc == execCommand) {
         /* If REDIS_MULTI flag is not set EXEC is just going to return an
          * error. */
-        if (!(c->flags & REDIS_MULTI)) return server.cluster.myself;
+        if (!(c->flags & REDIS_MULTI)) return server.cluster->myself;
         ms = &c->mstate;
     } else {
         /* In order to have a single codepath create a fake Multi State
@@ -1775,13 +2322,12 @@ clusterNode *getNodeByQuery(redisClient *c, struct redisCommand *cmd, robj **arg
                 firstkey = margv[keyindex[j]];
 
                 slot = keyHashSlot((char*)firstkey->ptr, sdslen(firstkey->ptr));
-                n = server.cluster.slots[slot];
+                n = server.cluster->slots[slot];
                 redisAssertWithInfo(c,firstkey,n != NULL);
             } else {
                 /* If it is not the first key, make sure it is exactly
                  * the same key as the first we saw. */
                 if (!equalStringObjects(firstkey,margv[keyindex[j]])) {
-                    decrRefCount(firstkey);
                     getKeysFreeResult(keyindex);
                     return NULL;
                 }
@@ -1792,27 +2338,27 @@ clusterNode *getNodeByQuery(redisClient *c, struct redisCommand *cmd, robj **arg
     if (ask) *ask = 0; /* This is the default. Set to 1 if needed later. */
     /* No key at all in command? then we can serve the request
      * without redirections. */
-    if (n == NULL) return server.cluster.myself;
+    if (n == NULL) return server.cluster->myself;
     if (hashslot) *hashslot = slot;
     /* This request is about a slot we are migrating into another instance?
      * Then we need to check if we have the key. If we have it we can reply.
      * If instead is a new key, we pass the request to the node that is
      * receiving the slot. */
-    if (n == server.cluster.myself &&
-        server.cluster.migrating_slots_to[slot] != NULL)
+    if (n == server.cluster->myself &&
+        server.cluster->migrating_slots_to[slot] != NULL)
     {
         if (lookupKeyRead(&server.db[0],firstkey) == NULL) {
             if (ask) *ask = 1;
-            return server.cluster.migrating_slots_to[slot];
+            return server.cluster->migrating_slots_to[slot];
         }
     }
     /* Handle the case in which we are receiving this hash slot from
      * another instance, so we'll accept the query even if in the table
      * it is assigned to a different node, but only if the client
      * issued an ASKING command before. */
-    if (server.cluster.importing_slots_from[slot] != NULL &&
-        c->flags & REDIS_ASKING) {
-        return server.cluster.myself;
+    if (server.cluster->importing_slots_from[slot] != NULL &&
+        (c->flags & REDIS_ASKING || cmd->flags & REDIS_CMD_ASKING)) {
+        return server.cluster->myself;
     }
     /* It's not a -ASK case. Base case: just return the right node. */
     return n;

@@ -1,5 +1,35 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 #include "sha1.h"   /* SHA1 is used for DEBUG DIGEST */
+#include "crc64.h"
 
 #include <arpa/inet.h>
 #include <signal.h>
@@ -8,12 +38,13 @@
 #include <execinfo.h>
 #include <ucontext.h>
 #include <fcntl.h>
+#include "bio.h"
 #endif /* HAVE_BACKTRACE */
 
 /* ================================= Debugging ============================== */
 
 /* Compute the sha1 of string at 's' with 'len' bytes long.
- * The SHA1 is then xored againt the string pointed by digest.
+ * The SHA1 is then xored against the string pointed by digest.
  * Since xor is commutative, this operation is used in order to
  * "add" digests relative to unordered elements.
  *
@@ -38,7 +69,7 @@ void xorObjectDigest(unsigned char *digest, robj *o) {
 }
 
 /* This function instead of just computing the SHA1 and xoring it
- * against diget, also perform the digest of "digest" itself and
+ * against digest, also perform the digest of "digest" itself and
  * replace the old value with the new one.
  *
  * So the final digest will be:
@@ -218,6 +249,10 @@ void computeDatasetDigest(unsigned char *final) {
 void debugCommand(redisClient *c) {
     if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
         *((char*)-1) = 'x';
+    } else if (!strcasecmp(c->argv[1]->ptr,"oom")) {
+        void *ptr = zmalloc(ULONG_MAX); /* Should trigger an out of memory. */
+        zfree(ptr);
+        addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"assert")) {
         if (c->argc >= 3) c->argv[2] = tryObjectEncoding(c->argv[2]);
         redisAssertWithInfo(c,c->argv[0],1 == 2);
@@ -349,7 +384,7 @@ void redisLogObjectDebugInfo(robj *o) {
     redisLog(REDIS_WARNING,"Object encoding: %d", o->encoding);
     redisLog(REDIS_WARNING,"Object refcount: %d", o->refcount);
     if (o->type == REDIS_STRING && o->encoding == REDIS_ENCODING_RAW) {
-        redisLog(REDIS_WARNING,"Object raw string len: %d", sdslen(o->ptr));
+        redisLog(REDIS_WARNING,"Object raw string len: %zu", sdslen(o->ptr));
         if (sdslen(o->ptr) < 4096)
             redisLog(REDIS_WARNING,"Object raw string content: \"%s\"", (char*)o->ptr);
     } else if (o->type == REDIS_LIST) {
@@ -432,10 +467,13 @@ static void *getMcontextEip(ucontext_t *uc) {
 void logStackContent(void **sp) {
     int i;
     for (i = 15; i >= 0; i--) {
+        unsigned long addr = (unsigned long) sp+i;
+        unsigned long val = (unsigned long) sp[i];
+
         if (sizeof(long) == 4)
-            redisLog(REDIS_WARNING, "(%08lx) -> %08lx", sp+i, sp[i]);
+            redisLog(REDIS_WARNING, "(%08lx) -> %08lx", addr, val);
         else
-            redisLog(REDIS_WARNING, "(%016lx) -> %016lx", sp+i, sp[i]);
+            redisLog(REDIS_WARNING, "(%016lx) -> %016lx", addr, val);
     }
 }
 
@@ -453,27 +491,27 @@ void logRegisters(ucontext_t *uc) {
     "R8 :%016lx R9 :%016lx\nR10:%016lx R11:%016lx\n"
     "R12:%016lx R13:%016lx\nR14:%016lx R15:%016lx\n"
     "RIP:%016lx EFL:%016lx\nCS :%016lx FS:%016lx  GS:%016lx",
-        uc->uc_mcontext->__ss.__rax,
-        uc->uc_mcontext->__ss.__rbx,
-        uc->uc_mcontext->__ss.__rcx,
-        uc->uc_mcontext->__ss.__rdx,
-        uc->uc_mcontext->__ss.__rdi,
-        uc->uc_mcontext->__ss.__rsi,
-        uc->uc_mcontext->__ss.__rbp,
-        uc->uc_mcontext->__ss.__rsp,
-        uc->uc_mcontext->__ss.__r8,
-        uc->uc_mcontext->__ss.__r9,
-        uc->uc_mcontext->__ss.__r10,
-        uc->uc_mcontext->__ss.__r11,
-        uc->uc_mcontext->__ss.__r12,
-        uc->uc_mcontext->__ss.__r13,
-        uc->uc_mcontext->__ss.__r14,
-        uc->uc_mcontext->__ss.__r15,
-        uc->uc_mcontext->__ss.__rip,
-        uc->uc_mcontext->__ss.__rflags,
-        uc->uc_mcontext->__ss.__cs,
-        uc->uc_mcontext->__ss.__fs,
-        uc->uc_mcontext->__ss.__gs
+        (unsigned long) uc->uc_mcontext->__ss.__rax,
+        (unsigned long) uc->uc_mcontext->__ss.__rbx,
+        (unsigned long) uc->uc_mcontext->__ss.__rcx,
+        (unsigned long) uc->uc_mcontext->__ss.__rdx,
+        (unsigned long) uc->uc_mcontext->__ss.__rdi,
+        (unsigned long) uc->uc_mcontext->__ss.__rsi,
+        (unsigned long) uc->uc_mcontext->__ss.__rbp,
+        (unsigned long) uc->uc_mcontext->__ss.__rsp,
+        (unsigned long) uc->uc_mcontext->__ss.__r8,
+        (unsigned long) uc->uc_mcontext->__ss.__r9,
+        (unsigned long) uc->uc_mcontext->__ss.__r10,
+        (unsigned long) uc->uc_mcontext->__ss.__r11,
+        (unsigned long) uc->uc_mcontext->__ss.__r12,
+        (unsigned long) uc->uc_mcontext->__ss.__r13,
+        (unsigned long) uc->uc_mcontext->__ss.__r14,
+        (unsigned long) uc->uc_mcontext->__ss.__r15,
+        (unsigned long) uc->uc_mcontext->__ss.__rip,
+        (unsigned long) uc->uc_mcontext->__ss.__rflags,
+        (unsigned long) uc->uc_mcontext->__ss.__cs,
+        (unsigned long) uc->uc_mcontext->__ss.__fs,
+        (unsigned long) uc->uc_mcontext->__ss.__gs
     );
     logStackContent((void**)uc->uc_mcontext->__ss.__rsp);
     #else
@@ -484,22 +522,22 @@ void logRegisters(ucontext_t *uc) {
     "EDI:%08lx ESI:%08lx EBP:%08lx ESP:%08lx\n"
     "SS:%08lx  EFL:%08lx EIP:%08lx CS :%08lx\n"
     "DS:%08lx  ES:%08lx  FS :%08lx GS :%08lx",
-        uc->uc_mcontext->__ss.__eax,
-        uc->uc_mcontext->__ss.__ebx,
-        uc->uc_mcontext->__ss.__ecx,
-        uc->uc_mcontext->__ss.__edx,
-        uc->uc_mcontext->__ss.__edi,
-        uc->uc_mcontext->__ss.__esi,
-        uc->uc_mcontext->__ss.__ebp,
-        uc->uc_mcontext->__ss.__esp,
-        uc->uc_mcontext->__ss.__ss,
-        uc->uc_mcontext->__ss.__eflags,
-        uc->uc_mcontext->__ss.__eip,
-        uc->uc_mcontext->__ss.__cs,
-        uc->uc_mcontext->__ss.__ds,
-        uc->uc_mcontext->__ss.__es,
-        uc->uc_mcontext->__ss.__fs,
-        uc->uc_mcontext->__ss.__gs
+        (unsigned long) uc->uc_mcontext->__ss.__eax,
+        (unsigned long) uc->uc_mcontext->__ss.__ebx,
+        (unsigned long) uc->uc_mcontext->__ss.__ecx,
+        (unsigned long) uc->uc_mcontext->__ss.__edx,
+        (unsigned long) uc->uc_mcontext->__ss.__edi,
+        (unsigned long) uc->uc_mcontext->__ss.__esi,
+        (unsigned long) uc->uc_mcontext->__ss.__ebp,
+        (unsigned long) uc->uc_mcontext->__ss.__esp,
+        (unsigned long) uc->uc_mcontext->__ss.__ss,
+        (unsigned long) uc->uc_mcontext->__ss.__eflags,
+        (unsigned long) uc->uc_mcontext->__ss.__eip,
+        (unsigned long) uc->uc_mcontext->__ss.__cs,
+        (unsigned long) uc->uc_mcontext->__ss.__ds,
+        (unsigned long) uc->uc_mcontext->__ss.__es,
+        (unsigned long) uc->uc_mcontext->__ss.__fs,
+        (unsigned long) uc->uc_mcontext->__ss.__gs
     );
     logStackContent((void**)uc->uc_mcontext->__ss.__esp);
     #endif
@@ -513,22 +551,22 @@ void logRegisters(ucontext_t *uc) {
     "EDI:%08lx ESI:%08lx EBP:%08lx ESP:%08lx\n"
     "SS :%08lx EFL:%08lx EIP:%08lx CS:%08lx\n"
     "DS :%08lx ES :%08lx FS :%08lx GS:%08lx",
-        uc->uc_mcontext.gregs[11],
-        uc->uc_mcontext.gregs[8],
-        uc->uc_mcontext.gregs[10],
-        uc->uc_mcontext.gregs[9],
-        uc->uc_mcontext.gregs[4],
-        uc->uc_mcontext.gregs[5],
-        uc->uc_mcontext.gregs[6],
-        uc->uc_mcontext.gregs[7],
-        uc->uc_mcontext.gregs[18],
-        uc->uc_mcontext.gregs[17],
-        uc->uc_mcontext.gregs[14],
-        uc->uc_mcontext.gregs[15],
-        uc->uc_mcontext.gregs[3],
-        uc->uc_mcontext.gregs[2],
-        uc->uc_mcontext.gregs[1],
-        uc->uc_mcontext.gregs[0]
+        (unsigned long) uc->uc_mcontext.gregs[11],
+        (unsigned long) uc->uc_mcontext.gregs[8],
+        (unsigned long) uc->uc_mcontext.gregs[10],
+        (unsigned long) uc->uc_mcontext.gregs[9],
+        (unsigned long) uc->uc_mcontext.gregs[4],
+        (unsigned long) uc->uc_mcontext.gregs[5],
+        (unsigned long) uc->uc_mcontext.gregs[6],
+        (unsigned long) uc->uc_mcontext.gregs[7],
+        (unsigned long) uc->uc_mcontext.gregs[18],
+        (unsigned long) uc->uc_mcontext.gregs[17],
+        (unsigned long) uc->uc_mcontext.gregs[14],
+        (unsigned long) uc->uc_mcontext.gregs[15],
+        (unsigned long) uc->uc_mcontext.gregs[3],
+        (unsigned long) uc->uc_mcontext.gregs[2],
+        (unsigned long) uc->uc_mcontext.gregs[1],
+        (unsigned long) uc->uc_mcontext.gregs[0]
     );
     logStackContent((void**)uc->uc_mcontext.gregs[7]);
     #elif defined(__X86_64__) || defined(__x86_64__)
@@ -540,25 +578,25 @@ void logRegisters(ucontext_t *uc) {
     "R8 :%016lx R9 :%016lx\nR10:%016lx R11:%016lx\n"
     "R12:%016lx R13:%016lx\nR14:%016lx R15:%016lx\n"
     "RIP:%016lx EFL:%016lx\nCSGSFS:%016lx",
-        uc->uc_mcontext.gregs[13],
-        uc->uc_mcontext.gregs[11],
-        uc->uc_mcontext.gregs[14],
-        uc->uc_mcontext.gregs[12],
-        uc->uc_mcontext.gregs[8],
-        uc->uc_mcontext.gregs[9],
-        uc->uc_mcontext.gregs[10],
-        uc->uc_mcontext.gregs[15],
-        uc->uc_mcontext.gregs[0],
-        uc->uc_mcontext.gregs[1],
-        uc->uc_mcontext.gregs[2],
-        uc->uc_mcontext.gregs[3],
-        uc->uc_mcontext.gregs[4],
-        uc->uc_mcontext.gregs[5],
-        uc->uc_mcontext.gregs[6],
-        uc->uc_mcontext.gregs[7],
-        uc->uc_mcontext.gregs[16],
-        uc->uc_mcontext.gregs[17],
-        uc->uc_mcontext.gregs[18]
+        (unsigned long) uc->uc_mcontext.gregs[13],
+        (unsigned long) uc->uc_mcontext.gregs[11],
+        (unsigned long) uc->uc_mcontext.gregs[14],
+        (unsigned long) uc->uc_mcontext.gregs[12],
+        (unsigned long) uc->uc_mcontext.gregs[8],
+        (unsigned long) uc->uc_mcontext.gregs[9],
+        (unsigned long) uc->uc_mcontext.gregs[10],
+        (unsigned long) uc->uc_mcontext.gregs[15],
+        (unsigned long) uc->uc_mcontext.gregs[0],
+        (unsigned long) uc->uc_mcontext.gregs[1],
+        (unsigned long) uc->uc_mcontext.gregs[2],
+        (unsigned long) uc->uc_mcontext.gregs[3],
+        (unsigned long) uc->uc_mcontext.gregs[4],
+        (unsigned long) uc->uc_mcontext.gregs[5],
+        (unsigned long) uc->uc_mcontext.gregs[6],
+        (unsigned long) uc->uc_mcontext.gregs[7],
+        (unsigned long) uc->uc_mcontext.gregs[16],
+        (unsigned long) uc->uc_mcontext.gregs[17],
+        (unsigned long) uc->uc_mcontext.gregs[18]
     );
     logStackContent((void**)uc->uc_mcontext.gregs[15]);
     #endif
@@ -625,12 +663,95 @@ void logCurrentClient(void) {
         de = dictFind(cc->db->dict, key->ptr);
         if (de) {
             val = dictGetVal(de);
-            redisLog(REDIS_WARNING,"key '%s' found in DB containing the following object:", key->ptr);
+            redisLog(REDIS_WARNING,"key '%s' found in DB containing the following object:", (char*)key->ptr);
             redisLogObjectDebugInfo(val);
         }
         decrRefCount(key);
     }
 }
+
+#if defined(HAVE_PROC_MAPS)
+void memtest_non_destructive_invert(void *addr, size_t size);
+void memtest_non_destructive_swap(void *addr, size_t size);
+#define MEMTEST_MAX_REGIONS 128
+
+int memtest_test_linux_anonymous_maps(void) {
+    FILE *fp = fopen("/proc/self/maps","r");
+    char line[1024];
+    size_t start_addr, end_addr, size;
+    size_t start_vect[MEMTEST_MAX_REGIONS];
+    size_t size_vect[MEMTEST_MAX_REGIONS];
+    int regions = 0, j;
+    uint64_t crc1 = 0, crc2 = 0, crc3 = 0;
+
+    while(fgets(line,sizeof(line),fp) != NULL) {
+        char *start, *end, *p = line;
+
+        start = p;
+        p = strchr(p,'-');
+        if (!p) continue;
+        *p++ = '\0';
+        end = p;
+        p = strchr(p,' ');
+        if (!p) continue;
+        *p++ = '\0';
+        if (strstr(p,"stack") ||
+            strstr(p,"vdso") ||
+            strstr(p,"vsyscall")) continue;
+        if (!strstr(p,"00:00")) continue;
+        if (!strstr(p,"rw")) continue;
+
+        start_addr = strtoul(start,NULL,16);
+        end_addr = strtoul(end,NULL,16);
+        size = end_addr-start_addr;
+
+        start_vect[regions] = start_addr;
+        size_vect[regions] = size;
+        printf("Testing %lx %lu\n", (unsigned long) start_vect[regions],
+                                    (unsigned long) size_vect[regions]);
+        regions++;
+    }
+
+    /* Test all the regions as an unique sequential region.
+     * 1) Take the CRC64 of the memory region. */
+    for (j = 0; j < regions; j++) {
+        crc1 = crc64(crc1,(void*)start_vect[j],size_vect[j]);
+    }
+
+    /* 2) Invert bits, swap adjacent words, swap again, invert bits.
+     * This is the error amplification step. */
+    for (j = 0; j < regions; j++)
+        memtest_non_destructive_invert((void*)start_vect[j],size_vect[j]);
+    for (j = 0; j < regions; j++)
+        memtest_non_destructive_swap((void*)start_vect[j],size_vect[j]);
+    for (j = 0; j < regions; j++)
+        memtest_non_destructive_swap((void*)start_vect[j],size_vect[j]);
+    for (j = 0; j < regions; j++)
+        memtest_non_destructive_invert((void*)start_vect[j],size_vect[j]);
+
+    /* 3) Take the CRC64 sum again. */
+    for (j = 0; j < regions; j++)
+        crc2 = crc64(crc2,(void*)start_vect[j],size_vect[j]);
+
+    /* 4) Swap + Swap again */
+    for (j = 0; j < regions; j++)
+        memtest_non_destructive_swap((void*)start_vect[j],size_vect[j]);
+    for (j = 0; j < regions; j++)
+        memtest_non_destructive_swap((void*)start_vect[j],size_vect[j]);
+
+    /* 5) Take the CRC64 sum again. */
+    for (j = 0; j < regions; j++)
+        crc3 = crc64(crc3,(void*)start_vect[j],size_vect[j]);
+
+    /* NOTE: It is very important to close the file descriptor only now
+     * because closing it before may result into unmapping of some memory
+     * region that we are testing. */
+    fclose(fp);
+
+    /* If the two CRC are not the same, we trapped a memory error. */
+    return crc1 != crc2 || crc2 != crc3;
+}
+#endif
 
 void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     ucontext_t *uc = (ucontext_t*) secret;
@@ -666,6 +787,19 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
 
     /* Log dump of processor registers */
     logRegisters(uc);
+
+#if defined(HAVE_PROC_MAPS)
+    /* Test memory */
+    redisLog(REDIS_WARNING, "--- FAST MEMORY TEST");
+    bioKillThreads();
+    if (memtest_test_linux_anonymous_maps()) {
+        redisLog(REDIS_WARNING,
+            "!!! MEMORY ERROR DETECTED! Check your memory ASAP !!!");
+    } else {
+        redisLog(REDIS_WARNING,
+            "Fast memory test PASSED, however your memory can still be broken. Please run a memory test for several hours if possible.");
+    }
+#endif
 
     redisLog(REDIS_WARNING,
 "\n=== REDIS BUG REPORT END. Make sure to include from START to END. ===\n\n"
@@ -744,7 +878,7 @@ void watchdogScheduleSignal(int period) {
     setitimer(ITIMER_REAL, &it, NULL);
 }
 
-/* Enable the software watchdong with the specified period in milliseconds. */
+/* Enable the software watchdog with the specified period in milliseconds. */
 void enableWatchdog(int period) {
     int min_period;
 
@@ -761,7 +895,7 @@ void enableWatchdog(int period) {
     /* If the configured period is smaller than twice the timer period, it is
      * too short for the software watchdog to work reliably. Fix it now
      * if needed. */
-    min_period = (1000/REDIS_HZ)*2;
+    min_period = (1000/server.hz)*2;
     if (period < min_period) period = min_period;
     watchdogScheduleSignal(period); /* Adjust the current timer. */
     server.watchdog_period = period;

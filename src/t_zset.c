@@ -1,6 +1,32 @@
-#include "redis.h"
-
-#include <math.h>
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
 
 /*-----------------------------------------------------------------------------
  * Sorted set API
@@ -22,6 +48,9 @@
  * c) there is a back pointer, so it's a doubly linked list with the back
  * pointers being only at "level 1". This allows to traverse the list
  * from tail to head, useful for ZREVRANGE. */
+
+#include "redis.h"
+#include <math.h>
 
 zskiplistNode *zslCreateNode(int level, double score, robj *obj) {
     zskiplistNode *zn = zmalloc(sizeof(*zn)+level*sizeof(struct zskiplistLevel));
@@ -96,7 +125,7 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, robj *obj) {
     }
     /* we assume the key is not already inside, since we allow duplicated
      * scores, and the re-insertion of score and redis object should never
-     * happpen since the caller of zslInsert() should test in the hash table
+     * happen since the caller of zslInsert() should test in the hash table
      * if the element is already inside or not. */
     level = zslRandomLevel();
     if (level > zsl->level) {
@@ -256,7 +285,7 @@ zskiplistNode *zslLastInRange(zskiplist *zsl, zrangespec range) {
 }
 
 /* Delete all the elements with score between min and max from the skiplist.
- * Min and mx are inclusive, so a score >= min || score <= max is deleted.
+ * Min and max are inclusive, so a score >= min || score <= max is deleted.
  * Note that this function takes the reference to the hash table view of the
  * sorted set, in order to remove the elements from the hash table too. */
 unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec range, dict *dict) {
@@ -815,9 +844,9 @@ void zaddGenericCommand(redisClient *c, int incr) {
     robj *ele;
     robj *zobj;
     robj *curobj;
-    double score = 0, *scores, curscore = 0.0;
+    double score = 0, *scores = NULL, curscore = 0.0;
     int j, elements = (c->argc-2)/2;
-    int added = 0;
+    int added = 0, updated = 0;
 
     if (c->argc % 2) {
         addReply(c,shared.syntaxerr);
@@ -830,11 +859,7 @@ void zaddGenericCommand(redisClient *c, int incr) {
     scores = zmalloc(sizeof(double)*elements);
     for (j = 0; j < elements; j++) {
         if (getDoubleFromObjectOrReply(c,c->argv[2+j*2],&scores[j],NULL)
-            != REDIS_OK)
-        {
-            zfree(scores);
-            return;
-        }
+            != REDIS_OK) goto cleanup;
     }
 
     /* Lookup the key and create the sorted set if does not exist. */
@@ -851,8 +876,7 @@ void zaddGenericCommand(redisClient *c, int incr) {
     } else {
         if (zobj->type != REDIS_ZSET) {
             addReply(c,shared.wrongtypeerr);
-            zfree(scores);
-            return;
+            goto cleanup;
         }
     }
 
@@ -869,10 +893,7 @@ void zaddGenericCommand(redisClient *c, int incr) {
                     score += curscore;
                     if (isnan(score)) {
                         addReplyError(c,nanerr);
-                        /* Don't need to check if the sorted set is empty
-                         * because we know it has at least one element. */
-                        zfree(scores);
-                        return;
+                        goto cleanup;
                     }
                 }
 
@@ -880,9 +901,8 @@ void zaddGenericCommand(redisClient *c, int incr) {
                 if (score != curscore) {
                     zobj->ptr = zzlDelete(zobj->ptr,eptr);
                     zobj->ptr = zzlInsert(zobj->ptr,ele,score);
-
-                    signalModifiedKey(c->db,key);
                     server.dirty++;
+                    updated++;
                 }
             } else {
                 /* Optimize: check if the element is too large or the list
@@ -892,10 +912,8 @@ void zaddGenericCommand(redisClient *c, int incr) {
                     zsetConvert(zobj,REDIS_ENCODING_SKIPLIST);
                 if (sdslen(ele->ptr) > server.zset_max_ziplist_value)
                     zsetConvert(zobj,REDIS_ENCODING_SKIPLIST);
-
-                signalModifiedKey(c->db,key);
                 server.dirty++;
-                if (!incr) added++;
+                added++;
             }
         } else if (zobj->encoding == REDIS_ENCODING_SKIPLIST) {
             zset *zs = zobj->ptr;
@@ -914,8 +932,7 @@ void zaddGenericCommand(redisClient *c, int incr) {
                         addReplyError(c,nanerr);
                         /* Don't need to check if the sorted set is empty
                          * because we know it has at least one element. */
-                        zfree(scores);
-                        return;
+                        goto cleanup;
                     }
                 }
 
@@ -927,29 +944,33 @@ void zaddGenericCommand(redisClient *c, int incr) {
                     znode = zslInsert(zs->zsl,score,curobj);
                     incrRefCount(curobj); /* Re-inserted in skiplist. */
                     dictGetVal(de) = &znode->score; /* Update score ptr. */
-
-                    signalModifiedKey(c->db,key);
                     server.dirty++;
+                    updated++;
                 }
             } else {
                 znode = zslInsert(zs->zsl,score,ele);
                 incrRefCount(ele); /* Inserted in skiplist. */
                 redisAssertWithInfo(c,NULL,dictAdd(zs->dict,ele,&znode->score) == DICT_OK);
                 incrRefCount(ele); /* Added to dictionary. */
-
-                signalModifiedKey(c->db,key);
                 server.dirty++;
-                if (!incr) added++;
+                added++;
             }
         } else {
             redisPanic("Unknown sorted set encoding");
         }
     }
-    zfree(scores);
     if (incr) /* ZINCRBY */
         addReplyDouble(c,score);
     else /* ZADD */
         addReplyLongLong(c,added);
+
+cleanup:
+    zfree(scores);
+    if (added || updated) {
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(REDIS_NOTIFY_ZSET,
+            incr ? "zincr" : "zadd", key, c->db->id);
+    }
 }
 
 void zaddCommand(redisClient *c) {
@@ -963,7 +984,7 @@ void zincrbyCommand(redisClient *c) {
 void zremCommand(redisClient *c) {
     robj *key = c->argv[1];
     robj *zobj;
-    int deleted = 0, j;
+    int deleted = 0, keyremoved = 0, j;
 
     if ((zobj = lookupKeyWriteOrReply(c,key,shared.czero)) == NULL ||
         checkType(c,zobj,REDIS_ZSET)) return;
@@ -1009,6 +1030,9 @@ void zremCommand(redisClient *c) {
     }
 
     if (deleted) {
+        notifyKeyspaceEvent(REDIS_NOTIFY_ZSET,"zrem",key,c->db->id);
+        if (keyremoved)
+            notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",key,c->db->id);
         signalModifiedKey(c->db,key);
         server.dirty += deleted;
     }
@@ -1019,6 +1043,7 @@ void zremrangebyscoreCommand(redisClient *c) {
     robj *key = c->argv[1];
     robj *zobj;
     zrangespec range;
+    int keyremoved = 0;
     unsigned long deleted;
 
     /* Parse the range arguments. */
@@ -1032,17 +1057,28 @@ void zremrangebyscoreCommand(redisClient *c) {
 
     if (zobj->encoding == REDIS_ENCODING_ZIPLIST) {
         zobj->ptr = zzlDeleteRangeByScore(zobj->ptr,range,&deleted);
-        if (zzlLength(zobj->ptr) == 0) dbDelete(c->db,key);
+        if (zzlLength(zobj->ptr) == 0) {
+            dbDelete(c->db,key);
+            keyremoved = 1;
+        }
     } else if (zobj->encoding == REDIS_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
         deleted = zslDeleteRangeByScore(zs->zsl,range,zs->dict);
         if (htNeedsResize(zs->dict)) dictResize(zs->dict);
-        if (dictSize(zs->dict) == 0) dbDelete(c->db,key);
+        if (dictSize(zs->dict) == 0) {
+            dbDelete(c->db,key);
+            keyremoved = 1;
+        }
     } else {
         redisPanic("Unknown sorted set encoding");
     }
 
-    if (deleted) signalModifiedKey(c->db,key);
+    if (deleted) {
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(REDIS_NOTIFY_ZSET,"zrembyscore",key,c->db->id);
+        if (keyremoved)
+            notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",key,c->db->id);
+    }
     server.dirty += deleted;
     addReplyLongLong(c,deleted);
 }
@@ -1054,6 +1090,7 @@ void zremrangebyrankCommand(redisClient *c) {
     long end;
     int llen;
     unsigned long deleted;
+    int keyremoved = 0;
 
     if ((getLongFromObjectOrReply(c, c->argv[2], &start, NULL) != REDIS_OK) ||
         (getLongFromObjectOrReply(c, c->argv[3], &end, NULL) != REDIS_OK)) return;
@@ -1078,19 +1115,30 @@ void zremrangebyrankCommand(redisClient *c) {
     if (zobj->encoding == REDIS_ENCODING_ZIPLIST) {
         /* Correct for 1-based rank. */
         zobj->ptr = zzlDeleteRangeByRank(zobj->ptr,start+1,end+1,&deleted);
-        if (zzlLength(zobj->ptr) == 0) dbDelete(c->db,key);
+        if (zzlLength(zobj->ptr) == 0) {
+            dbDelete(c->db,key);
+            keyremoved = 1;
+        }
     } else if (zobj->encoding == REDIS_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
 
         /* Correct for 1-based rank. */
         deleted = zslDeleteRangeByRank(zs->zsl,start+1,end+1,zs->dict);
         if (htNeedsResize(zs->dict)) dictResize(zs->dict);
-        if (dictSize(zs->dict) == 0) dbDelete(c->db,key);
+        if (dictSize(zs->dict) == 0) {
+            dbDelete(c->db,key);
+            keyremoved = 1;
+        }
     } else {
         redisPanic("Unknown sorted set encoding");
     }
 
-    if (deleted) signalModifiedKey(c->db,key);
+    if (deleted) {
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(REDIS_NOTIFY_ZSET,"zrembyrank",key,c->db->id);
+        if (keyremoved)
+            notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",key,c->db->id);
+    }
     server.dirty += deleted;
     addReplyLongLong(c,deleted);
 }
@@ -1468,7 +1516,7 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
     }
 
     /* test if the expected number of keys would overflow */
-    if (3+setnum > c->argc) {
+    if (setnum > c->argc-3) {
         addReply(c,shared.syntaxerr);
         return;
     }
@@ -1644,10 +1692,15 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
         dbAdd(c->db,dstkey,dstobj);
         addReplyLongLong(c,zsetLength(dstobj));
         if (!touched) signalModifiedKey(c->db,dstkey);
+        notifyKeyspaceEvent(REDIS_NOTIFY_ZSET,
+            (op == REDIS_OP_UNION) ? "zunionstore" : "zinterstore",
+            dstkey,c->db->id);
         server.dirty++;
     } else {
         decrRefCount(dstobj);
         addReply(c,shared.czero);
+        if (touched)
+            notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",dstkey,c->db->id);
     }
     zfree(src);
 }

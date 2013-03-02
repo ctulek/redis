@@ -1,3 +1,33 @@
+/* Redis Object implementation.
+ *
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 #include <math.h>
 #include <ctype.h>
@@ -42,7 +72,7 @@ robj *createStringObjectFromLongDouble(long double value) {
     int len;
 
     /* We use 17 digits precision since with 128 bit floats that precision
-     * after rouding is able to represent most small decimal numbers in a way
+     * after rounding is able to represent most small decimal numbers in a way
      * that is "non surprising" for the user (that is, most small decimal
      * numbers will be represented in a way that when converted back into
      * a string are exactly the same as what the user typed.) */
@@ -67,7 +97,7 @@ robj *dupStringObject(robj *o) {
 robj *createListObject(void) {
     list *l = listCreate();
     robj *o = createObject(REDIS_LIST,l);
-    listSetFreeMethod(l,decrRefCount);
+    listSetFreeMethod(l,decrRefCountVoid);
     o->encoding = REDIS_ENCODING_LINKEDLIST;
     return o;
 }
@@ -185,9 +215,7 @@ void incrRefCount(robj *o) {
     o->refcount++;
 }
 
-void decrRefCount(void *obj) {
-    robj *o = obj;
-
+void decrRefCount(robj *o) {
     if (o->refcount <= 0) redisPanic("decrRefCount against refcount <= 0");
     if (o->refcount == 1) {
         switch(o->type) {
@@ -202,6 +230,13 @@ void decrRefCount(void *obj) {
     } else {
         o->refcount--;
     }
+}
+
+/* This variant of decrRefCount() gets its argument as void, and is useful
+ * as free method in data structures that expect a 'void free_object(void*)'
+ * prototype for the free method. */
+void decrRefCountVoid(void *o) {
+    decrRefCount(o);
 }
 
 /* This function set the ref count to zero without freeing the object.

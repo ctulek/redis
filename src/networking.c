@@ -1,3 +1,32 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 #include <sys/uio.h>
 
@@ -29,7 +58,9 @@ redisClient *createClient(int fd) {
      * contexts (for instance a Lua script) we need a non connected client. */
     if (fd != -1) {
         anetNonBlock(NULL,fd);
-        anetTcpNoDelay(NULL,fd);
+        anetEnableTcpNoDelay(NULL,fd);
+        if (server.tcpkeepalive)
+            anetKeepAlive(NULL,fd,server.tcpkeepalive);
         if (aeCreateFileEvent(server.el,fd,AE_READABLE,
             readQueryFromClient, c) == AE_ERR)
         {
@@ -41,6 +72,7 @@ redisClient *createClient(int fd) {
 
     selectDb(c,0);
     c->fd = fd;
+    c->name = NULL;
     c->bufpos = 0;
     c->querybuf = sdsempty();
     c->querybuf_peak = 0;
@@ -55,22 +87,22 @@ redisClient *createClient(int fd) {
     c->ctime = c->lastinteraction = server.unixtime;
     c->authenticated = 0;
     c->replstate = REDIS_REPL_NONE;
+    c->reploff = 0;
     c->slave_listening_port = 0;
     c->reply = listCreate();
     c->reply_bytes = 0;
     c->obuf_soft_limit_reached_time = 0;
-    listSetFreeMethod(c->reply,decrRefCount);
+    listSetFreeMethod(c->reply,decrRefCountVoid);
     listSetDupMethod(c->reply,dupClientReplyValue);
-    c->bpop.keys = NULL;
-    c->bpop.count = 0;
+    c->bpop.keys = dictCreate(&setDictType,NULL);
     c->bpop.timeout = 0;
     c->bpop.target = NULL;
     c->io_keys = listCreate();
     c->watched_keys = listCreate();
-    listSetFreeMethod(c->io_keys,decrRefCount);
+    listSetFreeMethod(c->io_keys,decrRefCountVoid);
     c->pubsub_channels = dictCreate(&setDictType,NULL);
     c->pubsub_patterns = listCreate();
-    listSetFreeMethod(c->pubsub_patterns,decrRefCount);
+    listSetFreeMethod(c->pubsub_patterns,decrRefCountVoid);
     listSetMatchMethod(c->pubsub_patterns,listMatchObjects);
     if (fd != -1) listAddNodeTail(server.clients,c);
     initClientMultiState(c);
@@ -349,7 +381,7 @@ void *addDeferredMultiBulkLength(redisClient *c) {
     return listLast(c->reply);
 }
 
-/* Populate the length object and try glueing it to the next chunk. */
+/* Populate the length object and try gluing it to the next chunk. */
 void setDeferredMultiBulkLength(redisClient *c, void *node, long length) {
     listNode *ln = (listNode*)node;
     robj *len, *next;
@@ -375,7 +407,7 @@ void setDeferredMultiBulkLength(redisClient *c, void *node, long length) {
     asyncCloseClientOnOutputBufferLimitReached(c);
 }
 
-/* Add a duble as a bulk reply */
+/* Add a double as a bulk reply */
 void addReplyDouble(redisClient *c, double d) {
     char dbuf[128], sbuf[128];
     int dlen, slen;
@@ -486,16 +518,18 @@ void copyClientOutputBuffer(redisClient *dst, redisClient *src) {
     dst->reply_bytes = src->reply_bytes;
 }
 
-static void acceptCommonHandler(int fd) {
+static void acceptCommonHandler(int fd, int flags) {
     redisClient *c;
     if ((c = createClient(fd)) == NULL) {
-        redisLog(REDIS_WARNING,"Error allocating resoures for the client");
-        close(fd); /* May be already closed, just ingore errors */
+        redisLog(REDIS_WARNING,
+            "Error registering fd event for the new client: %s (fd=%d)",
+            strerror(errno),fd);
+        close(fd); /* May be already closed, just ignore errors */
         return;
     }
     /* If maxclient directive is set and this is one client more... close the
      * connection. Note that we create the client instead to check before
-     * for this condition, since now the socket is already set in nonblocking
+     * for this condition, since now the socket is already set in non-blocking
      * mode and we can send an error for free using the Kernel I/O */
     if (listLength(server.clients) > server.maxclients) {
         char *err = "-ERR max number of clients reached\r\n";
@@ -509,6 +543,7 @@ static void acceptCommonHandler(int fd) {
         return;
     }
     server.stat_numconnections++;
+    c->flags |= flags;
 }
 
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -524,7 +559,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         return;
     }
     redisLog(REDIS_VERBOSE,"Accepted %s:%d", cip, cport);
-    acceptCommonHandler(cfd);
+    acceptCommonHandler(cfd,0);
 }
 
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -539,7 +574,7 @@ void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         return;
     }
     redisLog(REDIS_VERBOSE,"Accepted connection to %s", server.unixsocket);
-    acceptCommonHandler(cfd);
+    acceptCommonHandler(cfd,REDIS_UNIX_SOCKET);
 }
 
 
@@ -561,11 +596,41 @@ void disconnectSlaves(void) {
     }
 }
 
+/* This function is called when the slave lose the connection with the
+ * master into an unexpected way. */
+void replicationHandleMasterDisconnection(void) {
+    server.master = NULL;
+    server.repl_state = REDIS_REPL_CONNECT;
+    server.repl_down_since = server.unixtime;
+    /* We lost connection with our master, force our slaves to resync
+     * with us as well to load the new data set.
+     *
+     * If server.masterhost is NULL the user called SLAVEOF NO ONE so
+     * slave resync is not needed. */
+    if (server.masterhost != NULL) disconnectSlaves();
+}
+
 void freeClient(redisClient *c) {
     listNode *ln;
 
     /* If this is marked as current client unset it */
     if (server.current_client == c) server.current_client = NULL;
+
+    /* If it is our master that's beging disconnected we should make sure
+     * to cache the state to try a partial resynchronization later.
+     *
+     * Note that before doing this we make sure that the client is not in
+     * some unexpected state, by checking its flags. */
+    if (server.master &&
+         (c->flags & REDIS_MASTER) &&
+        !(c->flags & (REDIS_CLOSE_AFTER_REPLY|
+                     REDIS_CLOSE_ASAP|
+                     REDIS_BLOCKED|
+                     REDIS_UNBLOCKED)))
+    {
+        replicationCacheMaster(c);
+        return;
+    }
 
     /* Note that if the client we are freeing is blocked into a blocking
      * call, we have to set querybuf to NULL *before* to call
@@ -576,6 +641,7 @@ void freeClient(redisClient *c) {
     c->querybuf = NULL;
     if (c->flags & REDIS_BLOCKED)
         unblockClientWaitingData(c);
+    dictRelease(c->bpop.keys);
 
     /* UNWATCH all the keys */
     unwatchAllKeys(c);
@@ -585,16 +651,21 @@ void freeClient(redisClient *c) {
     pubsubUnsubscribeAllPatterns(c,0);
     dictRelease(c->pubsub_channels);
     listRelease(c->pubsub_patterns);
-    /* Obvious cleanup */
-    aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
-    aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+    /* Close socket, unregister events, and remove list of replies and
+     * accumulated arguments. */
+    if (c->fd != -1) {
+        aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
+        aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+        close(c->fd);
+    }
     listRelease(c->reply);
     freeClientArgv(c);
-    close(c->fd);
     /* Remove from the list of clients */
-    ln = listSearchKey(server.clients,c);
-    redisAssert(ln != NULL);
-    listDelNode(server.clients,ln);
+    if (c->fd != -1) {
+        ln = listSearchKey(server.clients,c);
+        redisAssert(ln != NULL);
+        listDelNode(server.clients,ln);
+    }
     /* When client was just unblocked because of a blocking operation,
      * remove it from the list with unblocked clients. */
     if (c->flags & REDIS_UNBLOCKED) {
@@ -612,20 +683,15 @@ void freeClient(redisClient *c) {
         ln = listSearchKey(l,c);
         redisAssert(ln != NULL);
         listDelNode(l,ln);
+        /* We need to remember the time when we started to have zero
+         * attached slaves, as after some time we'll free the replication
+         * backlog. */
+        if (c->flags & REDIS_SLAVE && listLength(server.slaves) == 0)
+            server.repl_no_slaves_since = server.unixtime;
     }
 
     /* Case 2: we lost the connection with the master. */
-    if (c->flags & REDIS_MASTER) {
-        server.master = NULL;
-        server.repl_state = REDIS_REPL_CONNECT;
-        server.repl_down_since = server.unixtime;
-        /* We lost connection with our master, force our slaves to resync
-         * with us as well to load the new data set.
-         *
-         * If server.masterhost is NULL the user called SLAVEOF NO ONE so
-         * slave resync is not needed. */
-        if (server.masterhost != NULL) disconnectSlaves();
-    }
+    if (c->flags & REDIS_MASTER) replicationHandleMasterDisconnection();
 
     /* If this client was scheduled for async freeing we need to remove it
      * from the queue. */
@@ -636,6 +702,7 @@ void freeClient(redisClient *c) {
     }
 
     /* Release memory */
+    if (c->name) decrRefCount(c->name);
     zfree(c->argv);
     freeClientMultiState(c);
     zfree(c);
@@ -749,12 +816,16 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
 
 /* resetClient prepare the client to process the next command */
 void resetClient(redisClient *c) {
+    redisCommandProc *prevcmd = c->cmd ? c->cmd->proc : NULL;
+
     freeClientArgv(c);
     c->reqtype = 0;
     c->multibulklen = 0;
     c->bulklen = -1;
-    /* We clear the ASKING flag as well if we are not inside a MULTI. */
-    if (!(c->flags & REDIS_MULTI)) c->flags &= (~REDIS_ASKING);
+    /* We clear the ASKING flag as well if we are not inside a MULTI, and
+     * if what we just executed is not the ASKING command itself. */
+    if (!(c->flags & REDIS_MULTI) && prevcmd != askingCommand)
+        c->flags &= (~REDIS_ASKING);
 }
 
 int processInlineBuffer(redisClient *c) {
@@ -907,7 +978,7 @@ int processMultibulkBuffer(redisClient *c) {
             /* Not enough data (+2 == trailing \r\n) */
             break;
         } else {
-            /* Optimization: if the buffer contanins JUST our bulk element
+            /* Optimization: if the buffer contains JUST our bulk element
              * instead of creating a new object by *copying* the sds we
              * just use the current sds string. */
             if (pos == 0 &&
@@ -990,9 +1061,9 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     server.current_client = c;
     readlen = REDIS_IOBUF_LEN;
     /* If this is a multi bulk request, and we are processing a bulk reply
-     * that is large enough, try to maximize the probabilty that the query
-     * buffer contains excatly the SDS string representing the object, even
-     * at the risk of requring more read(2) calls. This way the function
+     * that is large enough, try to maximize the probability that the query
+     * buffer contains exactly the SDS string representing the object, even
+     * at the risk of requiring more read(2) calls. This way the function
      * processMultiBulkBuffer() can avoid copying buffers to create the
      * Redis Object representing the argument. */
     if (c->reqtype == REDIS_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1
@@ -1023,6 +1094,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (nread) {
         sdsIncrLen(c->querybuf,nread);
         c->lastinteraction = server.unixtime;
+        if (c->flags & REDIS_MASTER) c->reploff += nread;
     } else {
         server.current_client = NULL;
         return;
@@ -1062,10 +1134,11 @@ void getClientsMaxBuffers(unsigned long *longest_output_list,
 /* Turn a Redis client into an sds string representing its state. */
 sds getClientInfoString(redisClient *client) {
     char ip[32], flags[16], events[3], *p;
-    int port;
+    int port = 0; /* initialized to zero for the unix socket case. */
     int emask;
 
-    anetPeerToString(client->fd,ip,&port);
+    if (!(client->flags & REDIS_UNIX_SOCKET))
+        anetPeerToString(client->fd,ip,&port);
     p = flags;
     if (client->flags & REDIS_SLAVE) {
         if (client->flags & REDIS_MONITOR)
@@ -1080,6 +1153,7 @@ sds getClientInfoString(redisClient *client) {
     if (client->flags & REDIS_CLOSE_AFTER_REPLY) *p++ = 'c';
     if (client->flags & REDIS_UNBLOCKED) *p++ = 'u';
     if (client->flags & REDIS_CLOSE_ASAP) *p++ = 'A';
+    if (client->flags & REDIS_UNIX_SOCKET) *p++ = 'U';
     if (p == flags) *p++ = 'N';
     *p++ = '\0';
 
@@ -1089,8 +1163,11 @@ sds getClientInfoString(redisClient *client) {
     if (emask & AE_WRITABLE) *p++ = 'w';
     *p = '\0';
     return sdscatprintf(sdsempty(),
-        "addr=%s:%d fd=%d age=%ld idle=%ld flags=%s db=%d sub=%d psub=%d multi=%d qbuf=%lu qbuf-free=%lu obl=%lu oll=%lu omem=%lu events=%s cmd=%s",
-        ip,port,client->fd,
+        "addr=%s:%d fd=%d name=%s age=%ld idle=%ld flags=%s db=%d sub=%d psub=%d multi=%d qbuf=%lu qbuf-free=%lu obl=%lu oll=%lu omem=%lu events=%s cmd=%s",
+        (client->flags & REDIS_UNIX_SOCKET) ? server.unixsocket : ip,
+        port,
+        client->fd,
+        client->name ? (char*)client->name->ptr : "",
         (long)(server.unixtime - client->ctime),
         (long)(server.unixtime - client->lastinteraction),
         flags,
@@ -1155,8 +1232,41 @@ void clientCommand(redisClient *c) {
             }
         }
         addReplyError(c,"No such client");
+    } else if (!strcasecmp(c->argv[1]->ptr,"setname") && c->argc == 3) {
+        int j, len = sdslen(c->argv[2]->ptr);
+        char *p = c->argv[2]->ptr;
+
+        /* Setting the client name to an empty string actually removes
+         * the current name. */
+        if (len == 0) {
+            if (c->name) decrRefCount(c->name);
+            c->name = NULL;
+            addReply(c,shared.ok);
+            return;
+        }
+
+        /* Otherwise check if the charset is ok. We need to do this otherwise
+         * CLIENT LIST format will break. You should always be able to
+         * split by space to get the different fields. */
+        for (j = 0; j < len; j++) {
+            if (p[j] < '!' || p[j] > '~') { /* ASCII is assumed. */
+                addReplyError(c,
+                    "Client names cannot contain spaces, "
+                    "newlines or special characters.");
+                return;
+            }
+        }
+        if (c->name) decrRefCount(c->name);
+        c->name = c->argv[2];
+        incrRefCount(c->name);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"getname") && c->argc == 2) {
+        if (c->name)
+            addReplyBulk(c,c->name);
+        else
+            addReply(c,shared.nullbulk);
     } else {
-        addReplyError(c, "Syntax error, try CLIENT (LIST | KILL ip:port)");
+        addReplyError(c, "Syntax error, try CLIENT (LIST | KILL ip:port | GETNAME | SETNAME connection-name)");
     }
 }
 
@@ -1227,7 +1337,7 @@ unsigned long getClientOutputBufferMemoryUsage(redisClient *c) {
     return c->reply_bytes + (list_item_size*listLength(c->reply));
 }
 
-/* Get the class of a client, used in order to envorce limits to different
+/* Get the class of a client, used in order to enforce limits to different
  * classes of clients.
  *
  * The function will return one of the following:

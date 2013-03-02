@@ -1,3 +1,32 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 #include <math.h> /* isnan(), isinf() */
 
@@ -14,7 +43,7 @@ static int checkStringLength(redisClient *c, long long size) {
 }
 
 void setGenericCommand(redisClient *c, int nx, robj *key, robj *val, robj *expire, int unit) {
-    long long milliseconds = 0; /* initialized to avoid an harmness warning */
+    long long milliseconds = 0; /* initialized to avoid any harmness warning */
 
     if (expire) {
         if (getLongLongFromObjectOrReply(c, expire, &milliseconds, NULL) != REDIS_OK)
@@ -26,13 +55,16 @@ void setGenericCommand(redisClient *c, int nx, robj *key, robj *val, robj *expir
         if (unit == UNIT_SECONDS) milliseconds *= 1000;
     }
 
-    if (lookupKeyWrite(c->db,key) != NULL && nx) {
+    if (nx && lookupKeyWrite(c->db,key) != NULL) {
         addReply(c,shared.czero);
         return;
     }
     setKey(c->db,key,val);
     server.dirty++;
     if (expire) setExpire(c->db,key,mstime()+milliseconds);
+    notifyKeyspaceEvent(REDIS_NOTIFY_STRING,"set",key,c->db->id);
+    if (expire) notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,
+        "expire",key,c->db->id);
     addReply(c, nx ? shared.cone : shared.ok);
 }
 
@@ -79,6 +111,7 @@ void getsetCommand(redisClient *c) {
     if (getGenericCommand(c) == REDIS_ERR) return;
     c->argv[2] = tryObjectEncoding(c->argv[2]);
     setKey(c->db,c->argv[1],c->argv[2]);
+    notifyKeyspaceEvent(REDIS_NOTIFY_STRING,"set",c->argv[1],c->db->id);
     server.dirty++;
 }
 
@@ -140,6 +173,8 @@ void setrangeCommand(redisClient *c) {
         o->ptr = sdsgrowzero(o->ptr,offset+sdslen(value));
         memcpy((char*)o->ptr+offset,value,sdslen(value));
         signalModifiedKey(c->db,c->argv[1]);
+        notifyKeyspaceEvent(REDIS_NOTIFY_STRING,
+            "setrange",c->argv[1],c->db->id);
         server.dirty++;
     }
     addReplyLongLong(c,sdslen(o->ptr));
@@ -224,6 +259,7 @@ void msetGenericCommand(redisClient *c, int nx) {
     for (j = 1; j < c->argc; j += 2) {
         c->argv[j+1] = tryObjectEncoding(c->argv[j+1]);
         setKey(c->db,c->argv[j],c->argv[j+1]);
+        notifyKeyspaceEvent(REDIS_NOTIFY_STRING,"set",c->argv[j],c->db->id);
     }
     server.dirty += (c->argc-1)/2;
     addReply(c, nx ? shared.cone : shared.ok);
@@ -258,6 +294,7 @@ void incrDecrCommand(redisClient *c, long long incr) {
     else
         dbAdd(c->db,c->argv[1],new);
     signalModifiedKey(c->db,c->argv[1]);
+    notifyKeyspaceEvent(REDIS_NOTIFY_STRING,"incrby",c->argv[1],c->db->id);
     server.dirty++;
     addReply(c,shared.colon);
     addReply(c,new);
@@ -307,11 +344,12 @@ void incrbyfloatCommand(redisClient *c) {
     else
         dbAdd(c->db,c->argv[1],new);
     signalModifiedKey(c->db,c->argv[1]);
+    notifyKeyspaceEvent(REDIS_NOTIFY_STRING,"incrbyfloat",c->argv[1],c->db->id);
     server.dirty++;
     addReplyBulk(c,new);
 
     /* Always replicate INCRBYFLOAT as a SET command with the final value
-     * in order to make sure that differences in float pricision or formatting
+     * in order to make sure that differences in float precision or formatting
      * will not create differences in replicas or after an AOF restart. */
     aux = createStringObject("SET",3);
     rewriteClientCommandArgument(c,0,aux);
@@ -354,6 +392,7 @@ void appendCommand(redisClient *c) {
         totlen = sdslen(o->ptr);
     }
     signalModifiedKey(c->db,c->argv[1]);
+    notifyKeyspaceEvent(REDIS_NOTIFY_STRING,"append",c->argv[1],c->db->id);
     server.dirty++;
     addReplyLongLong(c,totlen);
 }
